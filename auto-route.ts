@@ -31,9 +31,13 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 
 const EDIT_TOOLS = new Set(["edit", "write"]);
+
+/** Output cost assumed for models without pricing data: mid-tier, neither free nor frontier. */
+const UNKNOWN_OUTPUT_COST = 1;
 
 /**
  * ID/name patterns excluded up front:
@@ -46,8 +50,17 @@ const EDIT_TOOLS = new Set(["edit", "write"]);
 const EXCLUDED_MODEL_RE =
 	/free|contributor|gemini-2\.5-|mimo-v2\.5\b|computer-use|robotics|deep-research/i;
 
+/**
+ * pi's agent config dir: honors PI_CODING_AGENT_DIR (its own env var, tilde
+ * expanded), else falls back to ~/.pi/agent.
+ */
+function agentDir(): string {
+	const envDir = process.env.PI_CODING_AGENT_DIR?.trim();
+	if (envDir) return envDir.startsWith("~") ? join(homedir(), envDir.slice(1)) : envDir;
+	return join(homedir(), ".pi", "agent");
+}
 /** File of permanently banned models (400/404/410 discovered on the fly). */
-const DENYLIST_FILE = `${process.env.HOME ?? ""}/.pi/agent/auto-route-denylist.json`;
+const DENYLIST_FILE = join(agentDir(), "auto-route-denylist.json");
 
 type Thinking = "off" | "low" | "medium" | "high" | "xhigh";
 type TierName = "frontier" | "strong" | "standard" | "eco";
@@ -114,13 +127,21 @@ function isPermanentFailure(message: string): boolean {
 }
 
 /**
- * 429 "provider quota limit" (subscription/quota exhausted). Original patterns
- * (the class pi marks NON-retryable: retrying the same provider is pointless
- * for it) plus the marker rewritten by `toFailoverRetryMessage` — single source
- * of truth for the check, both in `message_end` and in `route(reason: "retry")`.
+ * Any provider-wide limit (quota, rate limit, billing, bare 429): used on retry
+ * to decide provider-wide avoidance — an account-level limit hits every model
+ * of that provider, so failing over within it would fail again immediately.
  */
 const PROVIDER_LIMIT_RE =
-	/gousagelimiterror|freeusagelimiterror|monthly usage limit reached|available balance|insufficient_quota|out of budget|quota exceeded|billing|subscription_sharing|resource_exhausted|exceeded your current quota|429 provider quota/i;
+	/gousagelimiterror|freeusagelimiterror|usage limit|available balance|credit balance|insufficient_quota|out of budget|out of credit|quota|billing|subscription_sharing|resource_exhausted|rate.?limit|too many requests|\b429\b/i;
+
+/**
+ * The subset pi classifies as NON-retryable (its retry would never start, so
+ * the turn dies). Only those get rewritten into a retryable 429 by
+ * `toFailoverRetryMessage`; already-retryable errors (transient rate limits,
+ * 5xx…) keep their original text untouched.
+ */
+const NON_RETRYABLE_QUOTA_RE =
+	/gousagelimiterror|freeusagelimiterror|monthly usage limit reached|available balance|credit balance|insufficient_quota|out of budget|out of credit|quota exceeded|exceeded your current quota|billing|subscription_sharing|resource_exhausted/i;
 
 /**
  * Turns a provider-quota error into a "429" pi is willing to retry. Pi drops
@@ -137,7 +158,7 @@ export function toFailoverRetryMessage(msg: AssistantMessage): AssistantMessage 
 		!msg.errorMessage ||
 		!msg.provider ||
 		!msg.model ||
-		!PROVIDER_LIMIT_RE.test(msg.errorMessage)
+		!NON_RETRYABLE_QUOTA_RE.test(msg.errorMessage)
 	) {
 		return undefined;
 	}
@@ -153,8 +174,10 @@ function candidateModels(ctx: ExtensionContext): Model<never>[] {
 	return (ctx.modelRegistry.getAvailable() as Model<never>[]).filter((m) => {
 		if (permanentDenylist.has(modelKey(m))) return false;
 		if (EXCLUDED_MODEL_RE.test(m.id) || EXCLUDED_MODEL_RE.test(m.name)) return false;
-		const zeroCost = !m.cost || (m.cost.input === 0 && m.cost.output === 0);
-		return m.reasoning !== false && !zeroCost;
+		// A model is free only when its pricing says so; missing pricing means
+		// unknown, not free, so it stays a candidate.
+		const free = m.cost !== undefined && m.cost.input === 0 && m.cost.output === 0;
+		return m.reasoning !== false && !free;
 	});
 }
 
@@ -171,8 +194,10 @@ function buildTiers(ctx: ExtensionContext, avoid: string[] = []) {
 	);
 	const pool = filtered.length > 0 ? filtered : allCandidates;
 	const sorted = [...pool].sort((a, b) => {
-		const ca = a.cost?.output ?? 0;
-		const cb = b.cost?.output ?? 0;
+		// Unknown pricing ranks as mid cost so pricing-less models land in the
+		// middle tiers instead of being dumped into eco or promoted to frontier.
+		const ca = a.cost?.output ?? UNKNOWN_OUTPUT_COST;
+		const cb = b.cost?.output ?? UNKNOWN_OUTPUT_COST;
 		if (Math.abs(ca - cb) < 0.01) return (b.contextWindow ?? 0) - (a.contextWindow ?? 0);
 		return cb - ca;
 	});

@@ -12,11 +12,14 @@ import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+// pi's own agent-dir env var: the denylist must honor it (set before module load).
+const AGENT_DIR = mkdtempSync(join(tmpdir(), "auto-route-agent-"));
+process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
 process.env.HOME = mkdtempSync(join(tmpdir(), "auto-route-test-"));
 
 const { default: autoRoute, toFailoverRetryMessage } = await import("./auto-route.ts");
 
-const DENYLIST = join(process.env.HOME as string, ".pi/agent/auto-route-denylist.json");
+const DENYLIST = join(AGENT_DIR, "auto-route-denylist.json");
 
 function loadRouter() {
 	let vm: any;
@@ -223,4 +226,71 @@ test("retry on a transient error: the model is avoided, not the whole provider",
 	assert.ok(r.state.avoid.includes("opencode-go/glm-5.3"), "the failing model is avoided");
 	assert.ok(!r.state.avoid.includes("opencode-go"), "the whole provider is not avoided");
 	assert.notEqual(r.model.id, "glm-5.3");
+});
+
+test("a transient rate limit keeps its original text but still avoids the provider on retry", async () => {
+	const rateLimit: any = {
+		...QUOTA_ERROR,
+		provider: "anthropic",
+		model: "claude-test",
+		errorMessage: "429 rate_limit_error: too many requests",
+	};
+	assert.equal(
+		toFailoverRetryMessage(rateLimit),
+		undefined,
+		"already-retryable errors keep their original text",
+	);
+
+	const { vm } = loadRouter();
+	const models: any[] = [
+		{ provider: "anthropic", id: "claude-test", name: "Claude", reasoning: true, cost: { input: 2, output: 15 }, contextWindow: 200000 },
+		{ provider: "google", id: "gemini-4-argon", name: "Gemini 4", reasoning: true, cost: { input: 2, output: 10 }, contextWindow: 200000 },
+	];
+	const ctx: any = {
+		modelRegistry: {
+			getAvailable: () => models,
+			find: (p: string, id: string) => models.find((m) => m.provider === p && m.id === id),
+		},
+		ui: { setStatus: () => {} },
+	};
+
+	const r = await vm.route(
+		{
+			reason: "retry",
+			thinkingLevel: "xhigh",
+			failed: { model: models[0], thinkingLevel: "high", message: rateLimit },
+			messages: [{ role: "user", content: "ok" }],
+			state: undefined,
+		},
+		ctx,
+	);
+	assert.ok(r.state.avoid.includes("anthropic"), "a rate limit is account-wide: the provider is avoided");
+	assert.notEqual(r.model.provider, "anthropic", "the failover changes provider");
+});
+
+test("a model without pricing data is still a candidate", async () => {
+	const { vm } = loadRouter();
+	// No `cost` field at all: previously rejected as "free", now kept and
+	// ranked at the mid cost so it is still routable.
+	const models: any[] = [
+		{ provider: "acme", id: "mystery", name: "Mystery", reasoning: true, contextWindow: 100000 },
+	];
+	const ctx: any = {
+		modelRegistry: {
+			getAvailable: () => models,
+			find: (p: string, id: string) => models.find((m) => m.provider === p && m.id === id),
+		},
+		ui: { setStatus: () => {} },
+	};
+
+	const r = await vm.route(
+		{
+			reason: "user",
+			thinkingLevel: "low",
+			messages: [{ role: "user", content: "ok" }],
+			state: undefined,
+		},
+		ctx,
+	);
+	assert.equal(r.model.id, "mystery", "a pricing-less model must not be dropped from the catalog");
 });

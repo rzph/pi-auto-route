@@ -31,9 +31,15 @@ Pick **auto → auto** in the model selector (`/model`). Then, on every turn:
 - **`contributor`** models (OpenCode endpoints that train on your requests);
 - retired or deprecated generations: `gemini-2.5-*` (Google 404), `mimo-v2.5` (OpenCode 410);
 - specialized non-code models (`computer-use`, `robotics`, `deep-research`);
-- anything listed in `~/.pi/agent/auto-route-denylist.json` — banned automatically and **persistently** as soon as it returns a permanent error (400/404/410, "trains on request data", unsupported region…). Delete an entry from the file to restore a model.
+- anything listed in pi's agent dir as `auto-route-denylist.json` (`$PI_CODING_AGENT_DIR` if set, else `~/.pi/agent/`) — banned automatically and **persistently** as soon as it returns a permanent error (400/404/410, "trains on request data", unsupported region…). Delete an entry from the file to restore a model.
 
-Capacity ranking uses **output cost** as a proxy (ties broken by the largest contextWindow). An empty tier falls back to the next one; if everything fails, you get an explicit error.
+Capacity ranking uses **output cost** as a proxy (ties broken by the largest contextWindow). A model is excluded as free only when its pricing says 0; missing pricing means unknown and stays a candidate, ranked at a mid cost. An empty tier falls back to the next one; if everything fails, you get an explicit error.
+
+## Requirements
+
+- pi with at least one provider that has valid credentials. Nothing is hardcoded to a specific provider: the candidate catalog, the tiers and the failover are all built from your own model registry at runtime.
+- No API key of its own and no network calls: the difficulty heuristic runs entirely locally.
+- Only to run the test suite: Node.js 22.6 or newer (`node --test *.test.ts`).
 
 ## Install
 
