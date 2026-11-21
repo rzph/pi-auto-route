@@ -32,11 +32,13 @@ import { dirname } from "node:path";
 const EDIT_TOOLS = new Set(["edit", "write"]);
 
 /**
- * Fournisseurs exclus par défaut. opencode-go entraîne sur les requêtes
- * (sauf réglage explicite côté OpenCode) : incompatible avec un usage
- * orienté vie privée.
+ * Fournisseurs exclus par défaut : AUCUN. L'entraînement sur données chez
+ * OpenCode est un réglage PAR MODÈLE, pas par compte — le modèle fautif
+ * (« This OpenCode Go model trains on request data ») est banni
+ * individuellement par la denylist persistante au premier échec.
+ * Ajoute ici un fournisseur entier seulement en connaissance de cause.
  */
-const EXCLUDED_PROVIDERS = new Set<string>(["opencode-go"]);
+const EXCLUDED_PROVIDERS = new Set<string>([]);
 
 /** Fichier des modèles bannis définitivement (retirés, 404, …). */
 const DENYLIST_FILE = `${process.env.HOME ?? ""}/.pi/agent/auto-route-denylist.json`;
