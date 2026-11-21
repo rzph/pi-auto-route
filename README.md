@@ -44,6 +44,15 @@ Capacity ranking uses **output cost** as a proxy (ties broken by the largest con
 ## Install
 
 ```bash
+pi install npm:pi-auto-route
+```
+
+Then `/reload` and pick **auto → auto** in the model selector (`/model`). Updates come with `pi update --extensions`; removal with `pi remove npm:pi-auto-route`.
+
+Without npm, a local checkout works too: `pi install git:github.com/rzph/pi-auto-route`, or copy `auto-route.ts` into `~/.pi/agent/extensions/` by hand.
+
+
+```bash
 # for the session:
 pi -e /path/to/auto-route.ts
 
