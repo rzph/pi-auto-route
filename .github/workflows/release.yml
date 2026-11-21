@@ -16,7 +16,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+      # OIDC trusted publishing needs npm >= 11.5.1; Node 24 may bundle older.
+      - run: npm install -g npm@latest
       - name: Check tag matches package version
         run: |
           PKG_VERSION="v$(node -p "require('./package.json').version")"
@@ -24,4 +27,5 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION" >&2
             exit 1
           fi
+      - run: npm test
       - run: npm publish
