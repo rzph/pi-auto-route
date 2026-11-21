@@ -10,7 +10,11 @@
  * - le thinking choisi dans pi (`shift+tab`) agit comme PLAFOND ;
  * - failover sur retry (429/5xx) + écoute de `message_end` pour bannir
  *   PERSISTAMMENT les modèles qui renvoient 400/404 (car pi ne retry pas
- *   les 4xx autres que 429) ;
+ *   les 4xx autres que 429) ; les 429 « quota fournisseur » que pi juge
+ *   non-retryables sont réécrits en erreurs429 retryables pour déclencher
+ *   ce même failover (cross-provider) au lieu de faire échouer le tour ;
+ * - sélectionner `auto` part en thinking `low` par défaut (plafond modifiable
+ *   ensuite via shift+tab) ;
  * - UNE ligne de statut discrète (`⚡ modèle · thinking`) ;
  * - une bascule de modèle max par tour (cache de prompt préservé) ;
  * - compaction/résumés → le plus léger.
@@ -109,6 +113,40 @@ function isPermanentFailure(message: string): boolean {
 	);
 }
 
+/**
+ * 429 « limite de quota fournisseur » (abonnement/quota consommé). Motifs d'origine
+ * (classe que pi marque NON-retryable : retryer le même fournisseur est inutile pour
+ * lui) + le marqueur réécrit par `toFailoverRetryMessage` — source unique de vérité
+ * pour la détection, que ce soit dans `message_end` ou dans `route(reason: "retry")`.
+ */
+const PROVIDER_LIMIT_RE =
+	/gousagelimiterror|freeusagelimiterror|monthly usage limit reached|available balance|insufficient_quota|out of budget|quota exceeded|billing|subscription_sharing|resource_exhausted|exceeded your current quota|429 quota fournisseur/i;
+
+/**
+ * Convertit une erreur de quota fournisseur en erreur « 429 » que pi accepte de retry.
+ * Pi laisse tomber ces erreurs (inutile sur le même fournisseur) ; sous auto-route le
+ * failover change de fournisseur, donc le retry devient utile : pi rappelle alors
+ * `route(reason: "retry")` et le routeur bascule. Le texte réécrit contient le motif
+ * retryable « 429 » de pi et évite ses motifs non-retryables (billing, quota
+ * exceeded…) ; c'est aussi un marqueur lisible dans la transcription.
+ * Retourne undefined quand il n'y a rien à réécrire.
+ */
+export function toFailoverRetryMessage(msg: AssistantMessage): AssistantMessage | undefined {
+	if (
+		msg.stopReason !== "error" ||
+		!msg.errorMessage ||
+		!msg.provider ||
+		!msg.model ||
+		!PROVIDER_LIMIT_RE.test(msg.errorMessage)
+	) {
+		return undefined;
+	}
+	return {
+		...msg,
+		errorMessage: `auto-route: 429 quota fournisseur — ${msg.provider}/${msg.model} en limite ; nouvelle tentative sur un autre modèle`,
+	};
+}
+
 // ---------- Catalogue dynamique ----------
 
 function candidateModels(ctx: ExtensionContext): Model<never>[] {
@@ -126,7 +164,11 @@ function buildTiers(ctx: ExtensionContext, avoid: string[] = []) {
 		throw new Error("auto-route : aucun modèle candidat disponible (vérifie tes clés API)");
 	}
 	const avoidSet = new Set(avoid);
-	const filtered = allCandidates.filter((m) => !avoidSet.has(modelKey(m)));
+	// `avoid` accepte des clés `provider/id` (modèle) ou `provider` seul (fournisseur
+	// entier, quota épuisé : tous ses modèles échoueraient pareil).
+	const filtered = allCandidates.filter(
+		(m) => !avoidSet.has(modelKey(m)) && !avoidSet.has(m.provider),
+	);
 	const pool = filtered.length > 0 ? filtered : allCandidates;
 	const sorted = [...pool].sort((a, b) => {
 		const ca = a.cost?.output ?? 0;
@@ -295,15 +337,29 @@ function rerouteCurrentTurn(
 }
 
 export default function (pi: ExtensionAPI) {
-	// Pi ne déclenche PAS `route(reason: "retry")` sur les erreurs 400/404.
-	// On écoute donc `message_end` pour bannir définitivement le modèle fautif
-	// dès qu'une telle erreur survient.
-	pi.on("message_end", (event) => {
+	// Pi ne déclenche PAS `route(reason: "retry")` sur les erreurs 400/404 ni sur les
+	// 429 de quota fournisseur (classes non-retryables). On écoute `message_end` pour :
+	// 1. bannir définitivement les modèles en erreur définitive (400/404/410…) ;
+	// 2. réécrire les 429 de quota en erreur retryable, pour que pi déclenche son
+	//    retry → route(reason: "retry") → failover cross-provider au lieu du plantage.
+	pi.on("message_end", (event, ctx) => {
 		const msg = event.message as AssistantMessage;
-		if (msg?.role === "assistant" && msg.stopReason === "error" && msg.errorMessage) {
-			if (isPermanentFailure(msg.errorMessage) && msg.provider && msg.model) {
-				banPermanently(msg.provider, msg.model);
-			}
+		if (msg?.role !== "assistant" || msg.stopReason !== "error" || !msg.errorMessage) return;
+		if (isPermanentFailure(msg.errorMessage) && msg.provider && msg.model) {
+			banPermanently(msg.provider, msg.model);
+		}
+		if (ctx.model?.provider === "auto" && ctx.model?.id === "auto") {
+			const replacement = toFailoverRetryMessage(msg);
+			if (replacement) return { message: replacement };
+		}
+	});
+
+	// Sélectionner `auto` part en thinking `low` par défaut (plafond modifiable via
+	// shift+tab). `model_select` ne se déclenche que sur une sélection utilisateur :
+	// pi ne l'émet ni au démarrage ni à la restauration de session.
+	pi.on("model_select", (event) => {
+		if (event.model.provider === "auto" && event.model.id === "auto") {
+			pi.setThinkingLevel("low");
 		}
 	});
 
@@ -339,12 +395,23 @@ export default function (pi: ExtensionAPI) {
 					thinking: (request.failed.thinkingLevel ?? "medium") as Thinking,
 					avoid: [],
 				};
-				const avoid = [...new Set([...baseState.avoid, failedKey])];
+				const avoid = [
+					...new Set([
+						...baseState.avoid,
+						// Quota fournisseur : on évite tout le fournisseur, sinon le failover
+						// retombe sur un autre de ses modèles et re-échoue immédiatement.
+						PROVIDER_LIMIT_RE.test(request.failed.message?.errorMessage ?? "")
+							? request.failed.model.provider
+							: failedKey,
+					]),
+				];
 				const tiers = buildTiers(ctx, avoid);
 				const ladder: TierName[] =
 					avoid.length >= 3 ? ["standard", "eco"] : ["strong", "standard", "eco"];
 				const chosen =
-					ladder.map((t) => tiers[t]).find((m) => m && !avoid.includes(modelKey(m))) ??
+					ladder
+						.map((t) => tiers[t])
+						.find((m) => m && !avoid.includes(modelKey(m)) && !avoid.includes(m.provider)) ??
 					tiers.frontier;
 				const th = capThinking(baseState.thinking, userCap);
 				return toRoute(pi, ctx, chosen, th, prevState, {
@@ -377,7 +444,11 @@ export default function (pi: ExtensionAPI) {
 				// Pas d'edit → on garde le modèle courant pour préserver le cache de prompt
 				// et la liste `avoid` ; s'il a été banni entre-temps, repli de secours ci-dessous.
 				const currentKey = modelKey({ provider: prevState.providerId, id: prevState.modelId });
-				if (!permanentDenylist.has(currentKey) && !avoid.includes(currentKey)) {
+				if (
+					!permanentDenylist.has(currentKey) &&
+					!avoid.includes(currentKey) &&
+					!avoid.includes(prevState.providerId)
+				) {
 					const m = ctx.modelRegistry.find(prevState.providerId, prevState.modelId) as
 						| Model<never>
 						| undefined;

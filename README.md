@@ -46,6 +46,13 @@ Sélectionne **auto → auto** dans le sélecteur de modèles (`/model`). Ensuit
    plus léger. Le cache de prompt ne casse qu'une fois par tour.
 4. **Compaction et résumés invisibles** partent systématiquement sur le
    modèle le plus léger — la fuite de tokens que personne ne voit.
+5. **Failover automatique au lieu d'un plantage** : un timeout/surcharge
+   (429/5xx) bascule sur le modèle suivant du tour ; un **429 « quota
+   fournisseur »** (limite d'abonnement OpenCode, quota Google…) que pi
+   juge non-retryable est réécrit en erreur retryable, et le routeur
+   évite alors **tout le fournisseur** — le tour continue au lieu de
+   mourir. Les erreurs définitives (400/404/410) bannissent le modèle
+   via la denylist. Voir `failover.test.ts`.
 
 ### Ce qui est exclu des candidats
 
@@ -78,6 +85,8 @@ cp /chemin/vers/auto-route.ts ~/.pi/agent/extensions/auto-route.ts
 ```
 
 Puis `/model` → **auto → auto** (affiché « Auto (routage + thinking auto) »).
+La sélection part en thinking **`low`** par défaut — c'est un plafond :
+monte-le avec `shift+tab` quand tu veux laisser le routeur plus de réflexion.
 
 ## Personnaliser
 
@@ -85,7 +94,8 @@ Tout se règle en tête de fichier :
 
 - `difficultyScore()` : l'heuristique (signaux + seuils de longueur) —
   chaque signal est un bout de regex commenté ; recalibre et relance
-  `node --test heuristics.test.ts` après modification ;
+  `node --test *.test.ts` après modification (`heuristics.test.ts` pour
+  le score, `failover.test.ts` pour le 429 et le thinking par défaut) ;
 - `tierAndThinking()` : la correspondance score → palier + thinking ;
 - le filtre de `candidateModels()` si tu veux réintégrer les modèles
   gratuits ou non-reasoning.
