@@ -269,9 +269,15 @@ function toRoute(
 /** Reference to a path, file or repo → work on an existing codebase. */
 const PATHY =
 	/(?:\/(?:home|data|tmp|etc|usr|opt|var|srv)\/|~\/|\b[\w.+-]+\/[\w.-]+\.[A-Za-z0-9]{1,6}\b|\b[\w.+-]+\/[\w-]*-[\w-]+\b)/;
-/** Construction / modification / analysis verbs → the agent is about to do work. */
+/**
+ * Construction / modification / analysis verbs → the agent is about to do work.
+ * The colloquial imperatives (fais, regarde, prend, donne, met, lance, écris,
+ * essaie, montre) are as frequent as the formal ones in real prompts: leaving
+ * them out scored "fais le portage français" at 0.10 and routed a turn of 49
+ * tool calls and 82k output tokens to the eco tier.
+ */
 const ACTION =
-	/\b(reprend\w*|construi\w*|impl[ée]ment\w*|cré[ée]r?|cree\w*|g[ée]n[èe]r\w*|d[ée]velop\w*|migre\w*|refais|refaire|transforme\w*|modifi\w*|ajout\w*|supprim\w*|corrige\w*|corrig\w*|install\w*|configure\w*|[ée]crase\w*|r[ée]pare\w*|optimise\w*|nettoie\w*|remplace\w*|relance\w*|trouve\w*|cherch\w*|analy\w*|examin\w*|v[ée]rifi\w*|test\w*)\b/i;
+	/\b(reprend\w*|construi\w*|impl[ée]ment\w*|cré[ée]r?|cree\w*|g[ée]n[èe]r\w*|d[ée]velop\w*|migre\w*|refais|refaire|transforme\w*|modifi\w*|ajout\w*|supprim\w*|corrige\w*|corrig\w*|install\w*|configure\w*|[ée]crase\w*|r[ée]pare\w*|optimise\w*|nettoie\w*|remplace\w*|relance\w*|trouve\w*|cherch\w*|analy\w*|examin\w*|v[ée]rifi\w*|test\w*|fais\w*|faire|regarde\w*|prends?\b|donnes?\b|mets?\b|lance\w*|[ée]cris\b|essaie\w*|montre\w*)\b/i;
 /** Explicit intent from the requester. */
 const WANT = /\b(je veux|fais en sorte|fais[- ]moi|il faut|on pourrait|peux[- ]tu|besoin de)\b/i;
 /** Conceptual question → asks for a solid explanation. */
@@ -303,11 +309,14 @@ export function difficultyScore(text: string): number {
 }
 
 export function tierAndThinking(score: number): { tier: TierName; thinking: Thinking } {
-	// Thresholds calibrated on the 880 real turns (score → real-difficulty
-	// quartile table: 0.10-0.20 ≈ quartile 1, 0.30-0.45 ≈ quartile 2,
-	// ≥0.55 ≈ quartile 3).
-	if (score >= 0.7) return { tier: "frontier", thinking: "xhigh" };
-	if (score >= 0.5) return { tier: "strong", thinking: "high" };
+	// Thresholds raised from 0.50/0.70 to 0.60/0.75 on 926 real turns, after the
+	// ACTION regex picked up the colloquial imperatives: with both changes a
+	// path + verb pair no longer justifies an expensive tier ("corrige le bug
+	// dans src/foo.ts" used to reach strong). Measured against the real-difficulty
+	// proxy: expensive routings 104 → 85, heaviest-quartile turns sent to eco
+	// 82 → 53, light turns in an expensive tier 52 → 44, Spearman +0.288 → +0.339.
+	if (score >= 0.75) return { tier: "frontier", thinking: "xhigh" };
+	if (score >= 0.6) return { tier: "strong", thinking: "high" };
 	if (score >= 0.3) return { tier: "standard", thinking: "medium" };
 	return { tier: "eco", thinking: "low" };
 }

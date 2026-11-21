@@ -55,13 +55,34 @@ test("monotonicity: a heavy project always scores above a follow-up", () => {
 	assert.ok(hard > easy, `${hard} > ${easy}`);
 });
 
-test("tierAndThinking applies the calibrated 0.30 / 0.50 / 0.70 thresholds", () => {
+test("tierAndThinking applies the 0.30 / 0.60 / 0.75 thresholds", () => {
 	assert.deepEqual(tierAndThinking(0.1), { tier: "eco", thinking: "low" });
 	assert.deepEqual(tierAndThinking(0.29), { tier: "eco", thinking: "low" });
 	assert.deepEqual(tierAndThinking(0.3), { tier: "standard", thinking: "medium" });
 	assert.deepEqual(tierAndThinking(0.49), { tier: "standard", thinking: "medium" });
-	assert.deepEqual(tierAndThinking(0.5), { tier: "strong", thinking: "high" });
-	assert.deepEqual(tierAndThinking(0.69), { tier: "strong", thinking: "high" });
-	assert.deepEqual(tierAndThinking(0.7), { tier: "frontier", thinking: "xhigh" });
+	assert.deepEqual(tierAndThinking(0.59), { tier: "standard", thinking: "medium" });
+	assert.deepEqual(tierAndThinking(0.6), { tier: "strong", thinking: "high" });
+	assert.deepEqual(tierAndThinking(0.74), { tier: "strong", thinking: "high" });
+	assert.deepEqual(tierAndThinking(0.75), { tier: "frontier", thinking: "xhigh" });
 	assert.deepEqual(tierAndThinking(1), { tier: "frontier", thinking: "xhigh" });
+});
+
+test("colloquial imperatives are recognised as work requests", () => {
+	// "fais le portage français" drove 49 tool calls / 82k output tokens yet
+	// scored 0.10 before the ACTION regex learned the spoken imperatives.
+	for (const msg of [
+		"fais le portage français",
+		"regarde ce qui se passe dans le panel d'à côté",
+		"prends le fichier et mets-le à jour",
+		"lance le build et dis-moi si ça passe",
+	]) {
+		const s = difficultyScore(msg);
+		assert.ok(s >= 0.3, `${JSON.stringify(msg)} scored ${s}, expected ≥ 0.30`);
+	}
+});
+
+test("a path plus a plain verb no longer reaches an expensive tier", () => {
+	// Regression guard for the over-provisioning fix: this is a routine fix.
+	const s = difficultyScore("corrige le bug dans src/foo.ts");
+	assert.ok(s < 0.6, `score ${s} expected < 0.60 (would reach strong)`);
 });

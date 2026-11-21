@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.0
+
+- Economy and quality fixed together, measured on 926 real turns:
+  - turns routed to an expensive tier: 104 → 85;
+  - heaviest-quartile turns sent to the cheapest tier: 82/232 → 53/232;
+  - Spearman correlation with real difficulty: +0.288 → +0.339.
+- The `ACTION` verb list now recognises the spoken French imperatives (`fais`, `faire`, `regarde`, `prend`, `donne`, `met`, `lance`, `écris`, `essaie`, `montre`). They were as frequent as the formal verbs in real prompts but matched nothing, so "fais le portage français" — 49 tool calls, 82k output tokens — scored 0.10 and landed in `eco`.
+- Upper thresholds raised from 0.50/0.70 to 0.60/0.75: a path plus one verb is a routine request and no longer reaches `strong` ("corrige le bug dans src/foo.ts" used to).
+- Tests: 20 cases (the threshold table, the spoken imperatives, and a regression guard on the path-plus-verb over-provisioning).
+
 ## 1.1.0
 
 - Provider-agnostic: the failover now recognizes provider-wide limits from any provider (Anthropic rate limits, Google `RESOURCE_EXHAUSTED`, OpenAI `insufficient_quota`, OpenCode usage limits), not only OpenCode-specific errors.

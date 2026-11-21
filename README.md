@@ -42,10 +42,12 @@ On each turn, in order:
 
 1. **Score the message.** A local heuristic reads your last message and produces a score from 0 to 1. Signals of real work: a path or repo, action verbs, explicit intent, a conceptual question, code blocks, length. A terminal paste (three or more `$`/`sudo` lines) is penalised — a wall of shell output is not a hard task.
 2. **Pick a tier.** Your model catalog is sorted by output cost, used as a proxy for capacity (ties broken by the larger context window), and split into four tiers:
-   - score ≥ 0.7 — heavy work, several signals → most capable tier, thinking `xhigh`
-   - score ≥ 0.5 → strong tier, thinking `high`
+   - score ≥ 0.75 — heavy work, several independent signals → most capable tier, thinking `xhigh`
+   - score ≥ 0.6 → strong tier, thinking `high`
    - score ≥ 0.3 → standard tier, thinking `medium`
    - score < 0.3 — short follow-ups, quick questions → lightest tier, thinking `low`
+
+   The two upper thresholds are deliberately high: a path plus one verb is a routine request, not a hard one, and should not buy an expensive model.
 3. **Hand off after the first edit.** The chosen model plans and makes the first `edit`/`write`; the turn continues on the lightest tier (see Usage).
 4. **Compaction and invisible summaries** always go to the lightest model — the token leak nobody sees.
 5. **Failover instead of a crash.** A timeout or overload (429/5xx) moves to the next model of the ladder. A **429 provider-quota** error — which pi treats as non-retryable, so the turn would die — is rewritten into a retryable one, and the router then avoids the **whole provider**: the turn continues on another provider instead. Permanent errors (400/404/410, and messages like "trains on request data" or "unsupported region") ban the model persistently. See `failover.test.ts`.
@@ -72,13 +74,18 @@ Everything is set at the top of `auto-route.ts`:
 
 ## Calibration details
 
-The heuristic is a hand-written rule, not a trained model; the numbers below only measure it. They come from 880 real turns taken from local session logs (see `heuristics.test.ts`), comparing v1 against the current rule:
+The heuristic is a hand-written rule, not a trained model; the numbers below only measure it. They come from 926 real turns taken from local session logs (see `heuristics.test.ts`), scored against a real-difficulty proxy (the combined rank of a turn's tool calls and output tokens).
 
-- heaviest-quartile messages sent to the `eco` tier: **195/220 → 72/220** (the real win: less under-routing);
-- Spearman correlation between score and tool calls: **+0.16 → +0.28**;
-- overall quartile agreement: **30 % against 25 % for chance**.
+Current rule against the previous one:
 
-Read that last figure honestly: the score is an **asymmetric umbrella** — it shields heavy messages from the `eco` tier and at worst bumps a simple one step up. It is not a precise classifier of difficulty, and fine-grained prediction should not be expected from it.
+- heaviest-quartile turns sent to the `eco` tier: **82/232 → 53/232** — fewer heavy turns left on the cheapest model;
+- turns routed to an expensive tier: **104 → 85**;
+- light turns that still reached an expensive tier: **52 → 44**;
+- Spearman correlation between score and real difficulty: **+0.288 → +0.339**.
+
+Both directions improved at once because two separate faults were fixed together: the verb list had missed the spoken imperatives (`fais`, `regarde`, `prend`, `donne`, `met`, `lance`), which sent turns like "fais le portage français" — 49 tool calls, 82k output tokens — to `eco`; and the upper thresholds let a path plus one verb reach `strong`. The first version of the rule scored +0.16 with 195/220 of the heaviest turns in `eco`.
+
+Read the correlation honestly: the score is an **asymmetric umbrella** — it shields heavy messages from the `eco` tier and at worst bumps a simple one step up. It is not a precise classifier of difficulty, and fine-grained prediction should not be expected from it. Some heavy turns open with a single word ("tous") that no text heuristic can recognise from the message alone; those stay in `eco`.
 
 ## Portability
 
