@@ -6,7 +6,13 @@
  *   free models, training models (`contributor`) and retired generations
  *   (`gemini-2.5-*`);
  * - capacity tiers built at runtime (output cost as a proxy);
- * - locally estimated difficulty → tier + thinking;
+ * - difficulty of each NEW turn: ONE classification when a classifier model is
+ *   available (auto-detected from any provider with working credentials, free
+ *   ones first); otherwise — or on any failure (no classifier, low
+ *   confidence, timeout, error) — a local bilingual (FR + EN) heuristic scores
+ *   the message, as a silent fallback;
+ * - difficulty → tier + thinking: heuristic thresholds and classifier answers
+ *   map onto the same four tiers;
  * - the thinking level chosen in pi (`shift+tab`) acts as a CEILING;
  * - failover on retry (429/5xx) plus a `message_end` listener that bans
  *   PERMANENTLY models returning 400/404 (pi does not retry non-429 4xx);
@@ -15,7 +21,7 @@
  *   runs instead of letting the turn die;
  * - selecting `auto` starts at thinking `low` by default (ceiling, raise it
  *   later with shift+tab);
- * - ONE discreet status line (`⚡ model · thinking`);
+ * - ONE discreet status line (`⚡ model · thinking · source`);
  * - one model switch per turn (prompt cache preserved);
  * - compaction/summaries → the lightest model.
  *
@@ -72,6 +78,8 @@ interface RouteState {
 	thinking: Thinking;
 	/** provider/id entries avoided for THIS turn (transient failures). */
 	avoid: string[];
+	/** Where the tier decision came from: "local" or the classifier's key. */
+	source?: string;
 }
 
 function modelKey(m: { provider: string; id: string }): string {
@@ -85,7 +93,8 @@ function sameState(a: RouteState | undefined, b: RouteState): boolean {
 		a.providerId === b.providerId &&
 		a.thinking === b.thinking &&
 		a.avoid.length === b.avoid.length &&
-		a.avoid.every((v, i) => v === b.avoid[i])
+		a.avoid.every((v, i) => v === b.avoid[i]) &&
+		a.source === b.source
 	);
 }
 
@@ -119,9 +128,9 @@ function banPermanently(provider: string, modelId: string): void {
 	}
 }
 
-/** Permanent failure (model retired, 404/410, refuses training, unsupported region…). */
-function isPermanentFailure(message: string): boolean {
-	return /no longer available|not found|\b404\b|\b410\b|ModelDeprecated|deprecated|discontinued|trains on request data|hosted outside Europe|requires Global regions|does not exist|no API implementation|unsupported/i.test(
+/** Permanent failure (model retired, 404/410, refuses training, unsupported region, disabled model access…). */
+export function isPermanentFailure(message: string): boolean {
+	return /no longer available|not found|\b404\b|\b410\b|ModelDeprecated|deprecated|discontinued|trains on request data|hosted outside Europe|requires Global regions|does not exist|no API implementation|unsupported|permission_error|model access is disabled|access to this model|do not have access/i.test(
 		message,
 	);
 }
@@ -131,17 +140,28 @@ function isPermanentFailure(message: string): boolean {
  * to decide provider-wide avoidance — an account-level limit hits every model
  * of that provider, so failing over within it would fail again immediately.
  */
-const PROVIDER_LIMIT_RE =
+export const PROVIDER_LIMIT_RE =
 	/gousagelimiterror|freeusagelimiterror|usage limit|available balance|credit balance|insufficient_quota|out of budget|out of credit|quota|billing|subscription_sharing|resource_exhausted|rate.?limit|too many requests|\b429\b/i;
 
 /**
  * The subset pi classifies as NON-retryable (its retry would never start, so
  * the turn dies). Only those get rewritten into a retryable 429 by
  * `toFailoverRetryMessage`; already-retryable errors (transient rate limits,
- * 5xx…) keep their original text untouched.
+ * 5xx…) keep their original text untouched. Two families: provider-wide
+ * quota/billing limits, and model access disabled on the account (a 403 the
+ * provider never lifts for this key — same account, other models, still
+ * usable, so the model alone is avoided and the turn continues elsewhere).
  */
 const NON_RETRYABLE_QUOTA_RE =
-	/gousagelimiterror|freeusagelimiterror|monthly usage limit reached|available balance|credit balance|insufficient_quota|out of budget|out of credit|quota exceeded|exceeded your current quota|billing|subscription_sharing|resource_exhausted/i;
+	/gousagelimiterror|freeusagelimiterror|monthly usage limit reached|available balance|insufficient balance|credit balance|insufficient_quota|out of budget|out of credit|quota exceeded|exceeded your current quota|billing|subscription_sharing|resource_exhausted|permission_error|model access is disabled|access to this model|do not have access/i;
+
+/**
+ * Model-access family (subset of NON_RETRYABLE_QUOTA_RE): the account cannot
+ * use THIS model. Unlike a quota, other models of the same provider may still
+ * work, so the retry avoids the model alone, not the whole provider.
+ */
+const MODEL_ACCESS_RE =
+	/permission_error|model access is disabled|access to this model|do not have access|not enabled on this account/i;
 
 /**
  * Turns a provider-quota error into a "429" pi is willing to retry. Pi drops
@@ -162,9 +182,12 @@ export function toFailoverRetryMessage(msg: AssistantMessage): AssistantMessage 
 	) {
 		return undefined;
 	}
+	const modelAccess = MODEL_ACCESS_RE.test(msg.errorMessage);
 	return {
 		...msg,
-		errorMessage: `auto-route: 429 provider quota — ${msg.provider}/${msg.model} at limit; retrying on another model`,
+		errorMessage: modelAccess
+			? `auto-route: 429 model access — ${msg.provider}/${msg.model} not enabled on this account; retrying on another model`
+			: `auto-route: 429 provider quota — ${msg.provider}/${msg.model} at limit; retrying on another model`,
 	};
 }
 
@@ -219,17 +242,20 @@ function setStatusLine(
 	ctx: ExtensionContext,
 	m: Model<never>,
 	thinking: Thinking,
+	source?: string,
 ): void {
+	const shown = source ?? "local";
 	try {
 		const dim = ctx.ui.theme?.fg?.bind(ctx.ui.theme) ?? ((_: string, s: string) => s);
-		ctx.ui.setStatus("auto", dim("dim", `⚡ ${modelKey(m)} · ${thinking}`));
+		ctx.ui.setStatus("auto", dim("dim", `⚡ ${modelKey(m)} · ${thinking} · ${shown}`));
 	} catch {
-		ctx.ui.setStatus("auto", `${modelKey(m)} · ${thinking}`);
+		ctx.ui.setStatus("auto", `${modelKey(m)} · ${thinking} · ${shown}`);
 	}
 	pi.events.emit("auto-route:routed", {
 		provider: m.provider,
 		modelId: m.id,
 		thinking,
+		source: shown,
 	});
 }
 
@@ -238,10 +264,11 @@ function toRoute(
 	ctx: ExtensionContext,
 	m: Model<never>,
 	thinking: Thinking,
+	source: string | undefined,
 	prevState?: RouteState,
 	nextState?: RouteState,
 ): ModelRoute<RouteState> {
-	setStatusLine(pi, ctx, m, thinking);
+	setStatusLine(pi, ctx, m, thinking, source);
 	// Only return a new state object when it actually changed (avoids writing a
 	// session-tree entry on every continuation request).
 	const stateToStore =
@@ -274,20 +301,24 @@ const PATHY =
  * The colloquial imperatives (fais, regarde, prend, donne, met, lance, écris,
  * essaie, montre) are as frequent as the formal ones in real prompts: leaving
  * them out scored "fais le portage français" at 0.10 and routed a turn of 49
- * tool calls and 82k output tokens to the eco tier.
+ * tool calls and 82k output tokens to the eco tier. English stems a French
+ * pattern already covers (impl-, develop-, gener-, analy-, test, install: the
+ * accent classes hold the plain letters too) are not repeated.
  */
 const ACTION =
-	/\b(reprend\w*|construi\w*|impl[ée]ment\w*|cré[ée]r?|cree\w*|g[ée]n[èe]r\w*|d[ée]velop\w*|migre\w*|refais|refaire|transforme\w*|modifi\w*|ajout\w*|supprim\w*|corrige\w*|corrig\w*|install\w*|configure\w*|[ée]crase\w*|r[ée]pare\w*|optimise\w*|nettoie\w*|remplace\w*|relance\w*|trouve\w*|cherch\w*|analy\w*|examin\w*|v[ée]rifi\w*|test\w*|fais\w*|faire|regarde\w*|prends?\b|donnes?\b|mets?\b|lance\w*|[ée]cris\b|essaie\w*|montre\w*)\b/i;
-/** Explicit intent from the requester. */
-const WANT = /\b(je veux|fais en sorte|fais[- ]moi|il faut|on pourrait|peux[- ]tu|besoin de)\b/i;
+	/\b(reprend\w*|construi\w*|impl[ée]ment\w*|cré[ée]r?|cree\w*|g[ée]n[èe]r\w*|d[ée]velop\w*|migre\w*|refais|refaire|transforme\w*|modifi\w*|ajout\w*|supprim\w*|corrige\w*|corrig\w*|install\w*|configure\w*|[ée]crase\w*|r[ée]pare\w*|optimise\w*|nettoie\w*|remplace\w*|relance\w*|trouve\w*|cherch\w*|analy\w*|examin\w*|v[ée]rifi\w*|test\w*|fais\w*|faire|regarde\w*|prends?\b|donnes?\b|mets?\b|lance\w*|[ée]cris\b|essaie\w*|montre\w*|make|do(es)?\b|build|creat\w*|migrat\w*|redo|transform|modif\w*|add\w*|remov\w*|delet\w*|fix\w*|repair|configur\w*|overwrit\w*|optimi[sz]\w*|clean|replac\w*|relaunch|restart|find\w*|search\w*|exam\w*|check\w*|look\w*|take|put|launch\w*|run\b|writes?\b|try\b|show\w*|open\w*|read\w*|updat\w*|refactor\w*)\b/i;
+/** Explicit intent from the requester, in French or English. */
+const WANT =
+	/\b(je veux|fais en sorte|fais[- ]moi|il faut|on pourrait|peux[- ]tu|besoin de|i want|make sure|i need|can you|could you|we could|need to|please\b)\b/i;
 /** Conceptual question → asks for a solid explanation. */
 const QUESTION =
-	/\b(pourquoi|explique\w*|c'est quoi|c est quoi|comment (?:ça|ca) marche|diff[ée]rence entre|quelle est|quel est|est[- ]ce que)\b/i;
-/** Concept keywords, counted (up to 3). */
+	/\b(pourquoi|explique\w*|c'est quoi|c est quoi|comment (?:ça|ca) marche|diff[ée]rence entre|quelle est|quel est|est[- ]ce que|why\b|explain\w*|what (?:is|are|does)|what's|how (?:does|do|to)|difference between|which (?:is|one)|is there)\b/i;
+/** Concept keywords, counted (up to 3); French and English stems. */
 const CONCEPTS =
-	/\b(architecture|conception|refactor|d[ée]bogu|debug|optimis|s[ée]curit|timing|algorithme|compar|pourquoi|analyse|syst[èe]me|protocole)\b/gi;
-/** Explicit breakage / regression report. */
-const REGRESSION = /\b(pas le m[êe]me|r[ée]gression|cass[ée]|fuit|bloqu[ée]|corriger)\b/i;
+	/\b(architecture|conception|refactor|d[ée]bogu|debug|optimi[sz]|s[ée]curit|security|timing|algorithme|algorithm|compar|pourquoi|analyse|syst[èe]me|system|protocole|protocol|concept|tradeoff|modul\w*|scal\w*)\b/gi;
+/** Explicit breakage / regression report, in French or English. */
+const REGRESSION =
+	/\b(pas le m[êe]me|r[ée]gression|cass[ée]|fuit|bloqu[ée]|corriger|not the same|broken|broke\b|leak\w*|blocked|stuck|crash\w*|fails?\b|error\w*|wrong)\b/i;
 /** Shell prompt line (terminal paste: form, not difficulty). */
 const SHELLLINE = /^\s*(?:\$|sudo\s|#\s)/gm;
 
@@ -325,6 +356,87 @@ function capThinking(auto: Thinking, userSelected: Thinking): Thinking {
 	return THINKING_ORDER[Math.min(THINKING_ORDER.indexOf(auto), THINKING_ORDER.indexOf(userSelected))];
 }
 
+// Hybrid classifier (optional; auto-detected, silent fallback)
+
+/** Tier decision handed back by a classifier: target tier plus provenance. */
+export interface TierDecision {
+	tier: TierName;
+	thinking: Thinking;
+	via: string;
+}
+
+/** Classifier answer → tier, mirroring `tierAndThinking`'s thresholds. */
+const CHOICE_TO_TIER: Record<string, { tier: TierName; thinking: Thinking }> = {
+	light: { tier: "eco", thinking: "low" },
+	standard: { tier: "standard", thinking: "medium" },
+	complex: { tier: "strong", thinking: "high" },
+	heavy: { tier: "frontier", thinking: "xhigh" },
+};
+
+/**
+ * Asks an available classifier model to sort a turn into a tier: the catalog is
+ * auto-detected across every provider with working credentials, free
+ * classifiers first, then the cheaper ones. Only the user prompt is sent,
+ * truncated to 16k characters — never the system prompt, the history or tool
+ * results. The question is asked in English: classifiers are multilingual.
+ * Never throws: no classifier, a 4-second timeout, an abort, an unexpected
+ * answer or one below 0.50 confidence all return undefined, so the caller
+ * silently falls back to the local heuristic.
+ */
+export async function classifyTier(
+	ctx: ExtensionContext,
+	text: string,
+	signal?: AbortSignal,
+): Promise<TierDecision | undefined> {
+	try {
+		const models = await ctx.modelRegistry.getAvailableOfType("classifier");
+		if (!models || models.length === 0) return undefined;
+		// Free classifiers first, then ascending input cost; unknown pricing
+		// ranks last. Array sort is stable, so the catalog order survives.
+		const model = [...models].sort((a, b) => {
+			const freeA = a.cost?.input === 0;
+			const freeB = b.cost?.input === 0;
+			if (freeA !== freeB) return freeA ? -1 : 1;
+			return (
+				(a.cost?.input ?? Number.POSITIVE_INFINITY) -
+				(b.cost?.input ?? Number.POSITIVE_INFINITY)
+			);
+		})[0];
+		if (!model) return undefined;
+		const timeoutSignal = AbortSignal.timeout(4_000);
+		const result = await ctx.modelRegistry.classify(
+			model,
+			{
+				state: { prompt: text.slice(0, 16_000) },
+				questions: {
+					difficulty: {
+						type: "choice",
+						instructions:
+							"How demanding is the software engineering work requested in prompt?",
+						criteria: {
+							light: "A quick question, a short follow-up, or a trivial change",
+							standard: "An ordinary feature, fix, review, or explanation",
+							complex: "Subtle design, cross-cutting changes, or hard debugging",
+							heavy: "Architecture-level rework or a long multi-step implementation",
+						},
+					},
+				},
+			},
+			{ signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal },
+		);
+		if (result.stopReason !== "stop") return undefined;
+		const answer = result.answers?.difficulty;
+		if (answer?.type !== "choice") return undefined;
+		const decision = CHOICE_TO_TIER[answer.choice];
+		if (!decision) return undefined;
+		const probability = answer.probabilities[answer.choice] ?? answer.confidence ?? 0;
+		if (probability < 0.5) return undefined;
+		return { ...decision, via: modelKey(model) };
+	} catch {
+		return undefined;
+	}
+}
+
 // Utilities
 
 function lastUserText(messages: readonly Message[]): string {
@@ -349,26 +461,40 @@ function editedThisTurn(messages: readonly Message[]): boolean {
 
 /**
  * Shared entry point for a new turn and for the safety fallback of a
- * continuation (current model banned/missing): score the current message →
- * tier. `avoid` is empty on a new turn, preserved on a safety re-route.
+ * continuation (current model banned/missing): decide the tier of the current
+ * message — ONE classifier call when a classifier is available, the local
+ * bilingual heuristic otherwise. `avoid` is empty on a new turn, preserved on
+ * a safety re-route.
  */
-function rerouteCurrentTurn(
+async function rerouteCurrentTurn(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
-	request: Req,
+	request: ModelRouteRequest<RouteState>,
 	avoid: string[],
 	userCap: Thinking,
 	prevState?: RouteState,
-): ModelRoute<RouteState> {
-	const score = difficultyScore(lastUserText(request.messages));
-	const { tier, thinking: autoTh } = tierAndThinking(score);
-	const th = capThinking(autoTh, userCap);
+): Promise<ModelRoute<RouteState>> {
+	const text = lastUserText(request.messages);
+	// Classifier first; the local bilingual heuristic is the silent fallback.
+	const decision = await classifyTier(ctx, text, request.signal);
+	let tier: TierName;
+	let thinking: Thinking;
+	let source: string;
+	if (decision) {
+		({ tier, thinking } = decision);
+		source = decision.via;
+	} else {
+		({ tier, thinking } = tierAndThinking(difficultyScore(text)));
+		source = "local";
+	}
+	const th = capThinking(thinking, userCap);
 	const m = buildTiers(ctx, avoid)[tier];
-	return toRoute(pi, ctx, m, th, prevState, {
+	return toRoute(pi, ctx, m, th, source, prevState, {
 		modelId: m.id,
 		providerId: m.provider,
 		thinking: th,
 		avoid,
+		source,
 	});
 }
 
@@ -434,11 +560,15 @@ export default function (pi: ExtensionAPI) {
 				const avoid = [
 					...new Set([
 						...baseState.avoid,
-						// Provider quota: avoid the whole provider, otherwise the failover
-						// lands on another of its models and fails again immediately.
-						PROVIDER_LIMIT_RE.test(request.failed.message?.errorMessage ?? "")
-							? request.failed.model.provider
-							: failedKey,
+						// Model access disabled on the account: a per-model problem — other
+						// models of the same provider may still work, so avoid the model
+						// alone. Provider quota: avoid the whole provider, otherwise the
+						// failover lands on another of its models and fails again at once.
+						MODEL_ACCESS_RE.test(request.failed.message?.errorMessage ?? "")
+							? failedKey
+							: PROVIDER_LIMIT_RE.test(request.failed.message?.errorMessage ?? "")
+								? request.failed.model.provider
+								: failedKey,
 					]),
 				];
 				const tiers = buildTiers(ctx, avoid);
@@ -450,7 +580,7 @@ export default function (pi: ExtensionAPI) {
 						.find((m) => m && !avoid.includes(modelKey(m)) && !avoid.includes(m.provider)) ??
 					tiers.frontier;
 				const th = capThinking(baseState.thinking, userCap);
-				return toRoute(pi, ctx, chosen, th, prevState, {
+				return toRoute(pi, ctx, chosen, th, baseState.source, prevState, {
 					...baseState,
 					modelId: chosen.id,
 					providerId: chosen.provider,
@@ -468,7 +598,7 @@ export default function (pi: ExtensionAPI) {
 				if (editedThisTurn(request.messages)) {
 					const eco = buildTiers(ctx, avoid).eco;
 					const th = capThinking("medium", userCap);
-					return toRoute(pi, ctx, eco, th, prevState, {
+					return toRoute(pi, ctx, eco, th, prevState.source, prevState, {
 						...prevState,
 						modelId: eco.id,
 						providerId: eco.provider,
@@ -491,16 +621,19 @@ export default function (pi: ExtensionAPI) {
 						| undefined;
 					if (m) {
 						const th = capThinking(prevState.thinking, userCap);
-						return toRoute(pi, ctx, m, th, prevState, { ...prevState, thinking: th });
+						return toRoute(pi, ctx, m, th, prevState.source, prevState, {
+							...prevState,
+							thinking: th,
+						});
 					}
 				}
 				// Safety fallback: current model banned/missing → re-route the SAME
-				// turn (difficultyScore on the current message, `avoid` kept).
-				return rerouteCurrentTurn(pi, ctx, request, prevState.avoid, userCap, prevState);
+				// turn (classifier or local score on the current message, `avoid` kept).
+				return await rerouteCurrentTurn(pi, ctx, request, prevState.avoid, userCap, prevState);
 			}
 
-			// NEW TURN (user message)
-			return rerouteCurrentTurn(pi, ctx, request, [], userCap, prevState);
+			// NEW TURN (user message): one classifier call, else the local heuristic.
+			return await rerouteCurrentTurn(pi, ctx, request, [], userCap, prevState);
 		},
 	});
 }

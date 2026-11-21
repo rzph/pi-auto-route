@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.0
+
+- Bilingual heuristic: every signal regex gained English alternations; the French patterns stay. Paths, code blocks, message length and the terminal-paste penalty were already language-neutral.
+- Hybrid classifier mode: when a classifier model is available — auto-detected across all providers (TypeSafe Jev, OpenRouter decision models, Cloudflare Clef, GitHub Copilot decision models, OpenCode `jev-1.13-free`) — the router asks it one multiple-choice question (light / standard / complex / heavy) and maps the answer straight to the four tiers with their thinking levels. Only the user message is sent, truncated to 16k chars; never the system prompt, history or tool results. Free classifiers are preferred, then the cheaper ones; one classification per new turn, never on retries or continuations. The status line now shows the source: `local` or the classifier id (e.g. `jev-1.13-free`).
+- The zero-requirements install keeps working: confidence below 0.50, a 4-second timeout, any classifier error, or no classifier at all silently falls back to the local bilingual heuristic — no key, no config, no network.
+
 ## 1.2.0
 
 - Economy and quality fixed together, measured on 926 real turns:

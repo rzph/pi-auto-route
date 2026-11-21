@@ -1,6 +1,6 @@
 {
 	"name": "pi-auto-route",
-	"version": "1.2.0",
+	"version": "1.3.0",
 	"description": "A pi virtual model that routes each turn to the right physical model by task difficulty and adjusts the thinking level.",
 	"keywords": [
 		"pi-package",

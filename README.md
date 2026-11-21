@@ -22,32 +22,33 @@ Selecting `auto` starts at thinking `low`. That level is a **ceiling**, not a ta
 
 ## Usage
 
-Once selected, you do nothing else. On every turn the router picks a model on its own and shows one discreet status line: `⚡ provider/model · thinking`.
+Once selected, you do nothing else. On every turn the router picks a model on its own and shows one discreet status line: `⚡ provider/model · thinking · local` — the last tag is the source of the difficulty call, `local` or the classifier id (e.g. `jev-1.13-free`).
 
 Three things worth knowing up front:
 
-- **Language.** The difficulty heuristic scores your message with regex patterns written for **French**: action verbs (`reprend`, `modifie`, `corrige`…), explicit intent (`je veux`, `peux-tu`…), questions (`pourquoi`, `comment ça marche`…). On English prompts those signals rarely fire, so messages score lower than they should and land in the light tiers more often. Paths, code blocks, message length and the terminal-paste penalty are language-neutral, so the router still works — just less precisely. English patterns are welcome as a contribution.
+- **Language.** The local heuristic reads both French and English: every signal regex carries French and English alternations. When a classifier model is available on any of your providers, routing uses it instead — classifiers are language-agnostic. The regex path stays as the zero-dependency fallback.
 - **One switch per turn.** The first model plans and makes the first `edit`/`write`; the rest of the turn runs on the cheapest tier. The prompt cache therefore breaks only once per turn, which is why the trade-off favours turns with several tool calls.
 - **You stay in control.** `/model` to any real model takes over immediately; switch back to `auto` on the next turn to resume routing. To force one model for a single turn, switch away and back.
 
 ## Requirements
 
 - pi with at least one provider that has valid credentials. Nothing is hardcoded to a specific provider: the candidate catalog, the tiers and the failover are all built from your own model registry at runtime.
-- No API key of its own and no network calls: the difficulty heuristic runs entirely locally.
+- No API key of its own: without a classifier, the difficulty heuristic runs entirely locally, with no network calls.
+- A classifier model from any provider is optional and auto-detected; without one the local heuristic is used, so no extra credential is ever required.
 - Only to run the test suite: Node.js 22.6 or newer (`node --test *.test.ts`).
 
 ## How it works
 
 On each turn, in order:
 
-1. **Score the message.** A local heuristic reads your last message and produces a score from 0 to 1. Signals of real work: a path or repo, action verbs, explicit intent, a conceptual question, code blocks, length. A terminal paste (three or more `$`/`sudo` lines) is penalised — a wall of shell output is not a hard task.
+1. **Score the message.** The router tries a classifier first. Any classifier model in your registry is auto-detected across all providers (TypeSafe Jev, OpenRouter decision models, Cloudflare Clef, GitHub Copilot decision models, OpenCode `jev-1.13-free`…); free ones are preferred, then the cheaper ones. The router asks it one multiple-choice question on your last message — light, standard, complex or heavy — sending only that message, truncated to 16k characters: never the system prompt, the history or tool results. One classification runs per new turn, never on retries or continuations. Confidence below 0.50, a 4-second timeout, any classifier error, or no classifier at all falls back silently to the local heuristic. That heuristic is now bilingual: regex patterns read your last message in French and English and produce a score from 0 to 1. Signals of real work: a path or repo, action verbs, explicit intent, a conceptual question, code blocks, length. A terminal paste (three or more `$`/`sudo` lines) is penalised — a wall of shell output is not a hard task.
 2. **Pick a tier.** Your model catalog is sorted by output cost, used as a proxy for capacity (ties broken by the larger context window), and split into four tiers:
    - score ≥ 0.75 — heavy work, several independent signals → most capable tier, thinking `xhigh`
    - score ≥ 0.6 → strong tier, thinking `high`
    - score ≥ 0.3 → standard tier, thinking `medium`
    - score < 0.3 — short follow-ups, quick questions → lightest tier, thinking `low`
 
-   The two upper thresholds are deliberately high: a path plus one verb is a routine request, not a hard one, and should not buy an expensive model.
+   The two upper thresholds are deliberately high: a path plus one verb is a routine request, not a hard one, and should not buy an expensive model. The thresholds apply to the local score only; a classifier answer (light / standard / complex / heavy) maps straight onto the same four tiers with their thinking levels.
 3. **Hand off after the first edit.** The chosen model plans and makes the first `edit`/`write`; the turn continues on the lightest tier (see Usage).
 4. **Compaction and invisible summaries** always go to the lightest model — the token leak nobody sees.
 5. **Failover instead of a crash.** A timeout or overload (429/5xx) moves to the next model of the ladder. A **429 provider-quota** error — which pi treats as non-retryable, so the turn would die — is rewritten into a retryable one, and the router then avoids the **whole provider**: the turn continues on another provider instead. Permanent errors (400/404/410, and messages like "trains on request data" or "unsupported region") ban the model persistently. See `failover.test.ts`.
@@ -74,7 +75,7 @@ Everything is set at the top of `auto-route.ts`:
 
 ## Calibration details
 
-The heuristic is a hand-written rule, not a trained model; the numbers below only measure it. They come from 926 real turns taken from local session logs (see `heuristics.test.ts`), scored against a real-difficulty proxy (the combined rank of a turn's tool calls and output tokens).
+The heuristic is a hand-written rule, not a trained model; the numbers below only measure it, and they measure the local fallback path. They come from 926 real turns taken from local session logs (see `heuristics.test.ts`), scored against a real-difficulty proxy (the combined rank of a turn's tool calls and output tokens).
 
 Current rule against the previous one:
 
@@ -85,7 +86,7 @@ Current rule against the previous one:
 
 Both directions improved at once because two separate faults were fixed together: the verb list had missed the spoken imperatives (`fais`, `regarde`, `prend`, `donne`, `met`, `lance`), which sent turns like "fais le portage français" — 49 tool calls, 82k output tokens — to `eco`; and the upper thresholds let a path plus one verb reach `strong`. The first version of the rule scored +0.16 with 195/220 of the heaviest turns in `eco`.
 
-Read the correlation honestly: the score is an **asymmetric umbrella** — it shields heavy messages from the `eco` tier and at worst bumps a simple one step up. It is not a precise classifier of difficulty, and fine-grained prediction should not be expected from it. Some heavy turns open with a single word ("tous") that no text heuristic can recognise from the message alone; those stay in `eco`.
+Read the correlation honestly: the score is an **asymmetric umbrella** — it shields heavy messages from the `eco` tier and at worst bumps a simple one step up. It is not a precise classifier of difficulty, and fine-grained prediction should not be expected from it. Some heavy turns open with a single word ("tous") that no text heuristic can recognise from the message alone; those stay in `eco`. When a classifier model is available, the classifier path is the more precise one and needs no calibration.
 
 ## Portability
 

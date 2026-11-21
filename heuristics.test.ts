@@ -86,3 +86,33 @@ test("a path plus a plain verb no longer reaches an expensive tier", () => {
 	const s = difficultyScore("corrige le bug dans src/foo.ts");
 	assert.ok(s < 0.6, `score ${s} expected < 0.60 (would reach strong)`);
 });
+
+test("English work requests now rise through the bilingual ACTION regex", () => {
+	const s = difficultyScore("make a french port of this module and fix the tests");
+	assert.ok(s >= 0.3, `score ${s} expected ≥ 0.30`);
+});
+
+test("an explicit English refactor request reaches at least standard", () => {
+	const s = difficultyScore("refactor the authentication module and add unit tests for it");
+	assert.ok(s >= 0.5, `score ${s} expected ≥ 0.50`);
+});
+
+test("an English conceptual question rises above a plain follow-up", () => {
+	const q = difficultyScore("why does this test fail?");
+	const plain = difficultyScore("ok");
+	assert.ok(q > plain, `question ${q} > follow-up ${plain}`);
+});
+
+test("a plain English routine fix stays below strong", () => {
+	// English twin of the French over-provisioning guard above.
+	const s = difficultyScore("fix the bug in src/foo.ts");
+	assert.ok(s < 0.6, `score ${s} expected < 0.60 (would reach strong)`);
+});
+
+test("language parity: the same routine fix scores identically in French and English", () => {
+	// The pathy and ACTION bumps must fire with the same weight whatever the
+	// language, otherwise one language is systematically over-provisioned.
+	const fr = difficultyScore("corrige le bug dans src/foo.ts");
+	const en = difficultyScore("fix the bug in src/foo.ts");
+	assert.equal(fr, en, `French ${fr} must equal English ${en}`);
+});

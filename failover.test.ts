@@ -8,7 +8,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -18,6 +18,7 @@ process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
 process.env.HOME = mkdtempSync(join(tmpdir(), "auto-route-test-"));
 
 const { default: autoRoute, toFailoverRetryMessage } = await import("./auto-route.ts");
+const { isPermanentFailure, PROVIDER_LIMIT_RE } = await import("./auto-route.ts");
 
 const DENYLIST = join(AGENT_DIR, "auto-route-denylist.json");
 
@@ -85,6 +86,99 @@ test("a Google quota/billing 429 is rewritten too", () => {
 	assert.ok(out, "the Google 429 must be rewritten");
 	assert.match(out.errorMessage, /429/);
 	assert.ok(!/billing|quota exceeded/i.test(out.errorMessage));
+});
+
+test("a 403 model-access error is rewritten into a retryable 429 (found live: opencode Zen models disabled on a Go key)", () => {
+	const disabled: any = {
+		...QUOTA_ERROR,
+		provider: "opencode",
+		model: "gpt-5.4-pro",
+		errorMessage:
+			'opencode API error (403): {"type":"permission_error","message":"Model access is disabled. Change model access at https://opencode.ai/console/org_x/models."}',
+	};
+	const out = toFailoverRetryMessage(disabled);
+	assert.ok(out, "the 403 model-access error must be rewritten");
+	assert.match(out.errorMessage, /429/, "the rewritten text must carry pi's retryable 429");
+	assert.ok(
+		!/permission_error/i.test(out.errorMessage),
+		"the rewritten text must not carry the provider's non-retryable wording",
+	);
+	// A disabled model is a per-model problem: the whole provider must NOT be
+	// avoided (other models on the same account, free classifiers included,
+	// keep working).
+	assert.ok(!PROVIDER_LIMIT_RE.test(disabled.errorMessage));
+	// And the model itself is permanently banned.
+	assert.ok(isPermanentFailure(disabled.errorMessage));
+});
+
+test("an insufficient-balance 402 (pay-as-you-go provider not covered by the key) is rewritten", () => {
+	const balance: any = {
+		...QUOTA_ERROR,
+		provider: "opencode",
+		model: "gpt-5.5-pro",
+		errorMessage:
+			'opencode API error (402): {"type":"error","error":{"type":"invalid_request_error","message":"Insufficient balance. This request is pay-as-you-go, billed to OpenCode Models credits. Top up at https://opencode.ai/console/org_x/billing?credits=1. OpenCode Go covers only requests to the OpenCode Go provider."}}',
+	};
+	const out = toFailoverRetryMessage(balance);
+	assert.ok(out, "the 402 insufficient-balance error must be rewritten");
+	assert.match(out.errorMessage, /429/, "the rewritten text must carry pi's retryable 429");
+	assert.ok(
+		!/insufficient balance|billing/i.test(out.errorMessage),
+		"the rewritten text must not carry the provider's non-retryable wording",
+	);
+	// A balance problem is account-wide: the whole provider is the right scope.
+	assert.ok(PROVIDER_LIMIT_RE.test(out.errorMessage));
+	// Not permanent though: the account can be topped up later.
+	assert.ok(!isPermanentFailure(balance.errorMessage));
+});
+
+test("retry after a model-access 429 avoids the model, not the whole provider", async () => {
+	const { vm, handlers } = loadRouter();
+	const models: any[] = [
+		{ provider: "opencode", id: "gpt-5.4-pro", name: "GPT 5.4 Pro", reasoning: true, cost: { input: 5, output: 20 }, contextWindow: 200000 },
+		{ provider: "opencode", id: "glm-mini", name: "GLM Mini", reasoning: true, cost: { input: 1, output: 4 }, contextWindow: 200000 },
+		{ provider: "google", id: "gemini-4-argon", name: "Gemini 4", reasoning: true, cost: { input: 2, output: 10 }, contextWindow: 200000 },
+	];
+	const ctx: any = {
+		modelRegistry: {
+			getAvailable: () => models,
+			find: (p: string, id: string) => models.find((m) => m.provider === p && m.id === id),
+		},
+		ui: { setStatus: () => {} },
+	};
+
+	// pi hands the retry the message rewritten by message_end.
+	const disabled: any = {
+		...QUOTA_ERROR,
+		provider: "opencode",
+		model: "gpt-5.4-pro",
+		errorMessage:
+			'opencode API error (403): {"type":"permission_error","message":"Model access is disabled. Change model access at https://opencode.ai/console/org_x/models."}',
+	};
+	const rewritten = (await handlers.message_end[0]({ message: disabled }, { model: { provider: "auto", id: "auto" } })).message;
+	assert.match(rewritten.errorMessage, /429 model access/);
+
+	const r = await vm.route(
+		{
+			reason: "retry",
+			thinkingLevel: "xhigh",
+			failed: { model: models[0], thinkingLevel: "medium", message: rewritten },
+			messages: [{ role: "user", content: "ok" }],
+			state: undefined,
+		},
+		ctx,
+	);
+	assert.ok(
+		r.state?.avoid?.includes("opencode/gpt-5.4-pro"),
+		"the failed model must be avoided",
+	);
+	assert.ok(
+		!r.state?.avoid?.some((a: string) => a === "opencode"),
+		"the whole provider must NOT be avoided: other models of the account still work",
+	);
+	// The message_end call above legitimately banned the inaccessible model;
+	// remove the denylist so the later quota test starts from a clean slate.
+	rmSync(DENYLIST, { force: true });
 });
 
 test("toFailoverRetryMessage skips what does not need a rewrite", () => {
