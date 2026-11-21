@@ -31,22 +31,22 @@ import { dirname } from "node:path";
 
 const EDIT_TOOLS = new Set(["edit", "write"]);
 
-/** Fournisseurs exclus en bloc (aucun par défaut). */
-const EXCLUDED_PROVIDERS = new Set<string>([]);
-
 /**
  * Motifs d'ID/nom exclus d'office :
  * - `free` : quotas serrés / timeouts constants ;
  * - `contributor` : endpoints OpenCode qui entraînent sur tes requêtes ;
  * - `gemini-2.5-` : retirés par Google pour les nouveaux comptes (404) ;
+ * - `mimo-v2.5` : déprécié sur OpenCode Go (410 ModelDeprecated) ;
  * - `computer-use` / `robotics` / `deep-research` : modèles spécialisés non-code.
  */
-const EXCLUDED_MODEL_RE = /free|contributor|^gemini-2\.5-|computer-use|robotics|deep-research/i;
+const EXCLUDED_MODEL_RE =
+	/free|contributor|gemini-2\.5-|mimo-v2\.5\b|computer-use|robotics|deep-research/i;
 
-/** Fichier des modèles bannis définitivement (400/404 découverts au vol). */
+/** Fichier des modèles bannis définitivement (400/404/410 découverts au vol). */
 const DENYLIST_FILE = `${process.env.HOME ?? ""}/.pi/agent/auto-route-denylist.json`;
 
 type Thinking = "off" | "low" | "medium" | "high" | "xhigh";
+type TierName = "frontier" | "strong" | "standard" | "eco";
 const THINKING_ORDER: Thinking[] = ["off", "low", "medium", "high", "xhigh"];
 
 interface RouteState {
@@ -58,7 +58,21 @@ interface RouteState {
 	avoid: string[];
 }
 
-type Req = ModelRouteRequest<RouteState>;
+function modelKey(m: { provider: string; id: string }): string {
+	return `${m.provider}/${m.id}`;
+}
+
+function sameState(a: RouteState | undefined, b: RouteState): boolean {
+	if (!a) return false;
+	return (
+		a.phase === b.phase &&
+		a.modelId === b.modelId &&
+		a.providerId === b.providerId &&
+		a.thinking === b.thinking &&
+		a.avoid.length === b.avoid.length &&
+		a.avoid.every((v, i) => v === b.avoid[i])
+	);
+}
 
 // ---------- Denylist persistante ----------
 
@@ -83,16 +97,16 @@ function saveDenylist(set: Set<string>): void {
 const permanentDenylist = loadDenylist();
 
 function banPermanently(provider: string, modelId: string): void {
-	const k = `${provider}/${modelId}`;
+	const k = modelKey({ provider, id: modelId });
 	if (!permanentDenylist.has(k)) {
 		permanentDenylist.add(k);
 		saveDenylist(permanentDenylist);
 	}
 }
 
-/** Erreur définitive (modèle retiré, 404, refuse sans training, …). */
+/** Erreur définitive (modèle retiré, 404/410, refuse sans training, région non autorisée…). */
 function isPermanentFailure(message: string): boolean {
-	return /no longer available|not found|404|trains on request data|invalid_request_error|does not exist|deprecated|discontinued|unsupported/i.test(
+	return /no longer available|not found|\b404\b|\b410\b|ModelDeprecated|deprecated|discontinued|trains on request data|hosted outside Europe|requires Global regions|does not exist|no API implementation|unsupported/i.test(
 		message,
 	);
 }
@@ -100,9 +114,8 @@ function isPermanentFailure(message: string): boolean {
 // ---------- Catalogue dynamique ----------
 
 function candidateModels(ctx: ExtensionContext): Model<never>[] {
-	const excluded = new Set([...EXCLUDED_PROVIDERS, ...permanentDenylist]);
 	return (ctx.modelRegistry.getAvailable() as Model<never>[]).filter((m) => {
-		if (excluded.has(m.provider) || excluded.has(`${m.provider}/${m.id}`)) return false;
+		if (permanentDenylist.has(modelKey(m))) return false;
 		if (EXCLUDED_MODEL_RE.test(m.id) || EXCLUDED_MODEL_RE.test(m.name)) return false;
 		const zeroCost = !m.cost || (m.cost.input === 0 && m.cost.output === 0);
 		return m.reasoning !== false && !zeroCost;
@@ -110,11 +123,13 @@ function candidateModels(ctx: ExtensionContext): Model<never>[] {
 }
 
 function buildTiers(ctx: ExtensionContext, avoid: string[] = []) {
-	let pool = candidateModels(ctx).filter((m) => !avoid.includes(`${m.provider}/${m.id}`));
-	if (pool.length === 0) pool = candidateModels(ctx);
-	if (pool.length === 0) {
+	const allCandidates = candidateModels(ctx);
+	if (allCandidates.length === 0) {
 		throw new Error("auto-route : aucun modèle candidat disponible (vérifie tes clés API)");
 	}
+	const avoidSet = new Set(avoid);
+	const filtered = allCandidates.filter((m) => !avoidSet.has(modelKey(m)));
+	const pool = filtered.length > 0 ? filtered : allCandidates;
 	const sorted = [...pool].sort((a, b) => {
 		const ca = a.cost?.output ?? 0;
 		const cb = b.cost?.output ?? 0;
@@ -134,33 +149,42 @@ function buildTiers(ctx: ExtensionContext, avoid: string[] = []) {
 
 // ---------- Statut (une seule ligne, discrète) ----------
 
-function setStatusLine(ctx: ExtensionContext, m: Model<never>, thinking: Thinking): void {
-	try {
-		const dim = ctx.ui.theme?.fg?.bind(ctx.ui.theme) ?? ((_: string, s: string) => s);
-		ctx.ui.setStatus("auto", dim("dim", `⚡ ${m.provider}/${m.id} · ${thinking}`));
-	} catch {
-		ctx.ui.setStatus("auto", `${m.provider}/${m.id} · ${thinking}`);
-	}
-}
-
-function toRoute(
+function setStatusLine(
+	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	m: Model<never>,
 	thinking: Thinking,
-	state?: RouteState,
+): void {
+	try {
+		const dim = ctx.ui.theme?.fg?.bind(ctx.ui.theme) ?? ((_: string, s: string) => s);
+		ctx.ui.setStatus("auto", dim("dim", `⚡ ${modelKey(m)} · ${thinking}`));
+	} catch {
+		ctx.ui.setStatus("auto", `${modelKey(m)} · ${thinking}`);
+	}
+	pi.events.emit("auto-route:routed", {
+		provider: m.provider,
+		modelId: m.id,
+		thinking,
+	});
+}
+
+function toRoute(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	m: Model<never>,
+	thinking: Thinking,
+	prevState?: RouteState,
+	nextState?: RouteState,
 ): ModelRoute<RouteState> {
-	setStatusLine(ctx, m, thinking);
+	setStatusLine(pi, ctx, m, thinking);
+	// Ne retourner un nouvel objet state que lorsqu'il change réellement (évite d'écrire
+	// une entrée dans l'arbre de session Pi à chaque requête de continuation).
+	const stateToStore =
+		nextState && !sameState(prevState, nextState) ? nextState : undefined;
 	return {
 		model: m,
 		thinkingLevel: thinking,
-		state:
-			state ?? {
-				phase: "start",
-				modelId: m.id,
-				providerId: m.provider,
-				thinking,
-				avoid: [],
-			},
+		state: stateToStore,
 	};
 }
 
@@ -181,11 +205,11 @@ function difficultyScore(text: string): number {
 	return Math.min(1, score);
 }
 
-function tierFor(score: number): "frontier" | "strong" | "standard" | "eco" {
-	if (score >= 0.7) return "frontier";
-	if (score >= 0.45) return "strong";
-	if (score >= 0.25) return "standard";
-	return "eco";
+function tierAndThinking(score: number): { tier: TierName; thinking: Thinking } {
+	if (score >= 0.7) return { tier: "frontier", thinking: "xhigh" };
+	if (score >= 0.45) return { tier: "strong", thinking: "high" };
+	if (score >= 0.25) return { tier: "standard", thinking: "medium" };
+	return { tier: "eco", thinking: "low" };
 }
 
 function capThinking(auto: Thinking, userSelected: Thinking): Thinking {
@@ -235,80 +259,93 @@ export default function (pi: ExtensionAPI) {
 		contextWindow: 200_000,
 		maxTokens: 64_000,
 		async route(request, ctx) {
+			const userCap = (request.thinkingLevel ?? "xhigh") as Thinking;
+
+			// Compaction / résumés hors boucle agent : pas d'état de session.
 			if (request.reason === "direct") {
-				return toRoute(ctx, buildTiers(ctx).background, "low");
+				return {
+					model: buildTiers(ctx).background,
+					thinkingLevel: "low",
+				};
 			}
+
+			const prevState = request.state;
 
 			// ---- RETRY / failover (429 / 5xx) ----
 			if (request.reason === "retry" && request.failed) {
-				const failedKey = `${request.failed.model.provider}/${request.failed.model.id}`;
+				const failedKey = modelKey(request.failed.model);
 				if (isPermanentFailure(request.failed.message?.errorMessage ?? "")) {
 					banPermanently(request.failed.model.provider, request.failed.model.id);
 				}
-				const state: RouteState = request.state ?? {
+				const baseState: RouteState = prevState ?? {
 					phase: "start",
 					modelId: request.failed.model.id,
 					providerId: request.failed.model.provider,
 					thinking: (request.failed.thinkingLevel ?? "medium") as Thinking,
 					avoid: [],
 				};
-				const avoid = [...new Set([...state.avoid, failedKey])];
+				const avoid = [...new Set([...baseState.avoid, failedKey])];
 				const tiers = buildTiers(ctx, avoid);
-				const ladder: Array<["frontier" | "strong" | "standard" | "eco", Thinking]> =
-					avoid.length >= 3
-						? [["standard", state.thinking], ["eco", state.thinking]]
-						: [["strong", state.thinking], ["standard", state.thinking], ["eco", state.thinking]];
-				for (const [tier, th] of ladder) {
-					const m = tiers[tier];
-					if (m && !avoid.includes(`${m.provider}/${m.id}`)) {
-						return toRoute(ctx, m, th, { ...state, avoid });
-					}
-				}
-				const any = buildTiers(ctx, avoid).frontier;
-				return toRoute(ctx, any, state.thinking, { ...state, avoid });
+				const ladder: TierName[] =
+					avoid.length >= 3 ? ["standard", "eco"] : ["strong", "standard", "eco"];
+				const chosen =
+					ladder.map((t) => tiers[t]).find((m) => m && !avoid.includes(modelKey(m))) ??
+					tiers.frontier;
+				const th = capThinking(baseState.thinking, userCap);
+				return toRoute(pi, ctx, chosen, th, prevState, {
+					...baseState,
+					modelId: chosen.id,
+					providerId: chosen.provider,
+					thinking: th,
+					avoid,
+				});
 			}
 
-			const state = request.state;
+			// ---- CONTINUATION (suite du même tour après appels d'outils) ----
+			if (request.reason === "continuation" && prevState) {
+				const avoid = prevState.avoid ?? [];
 
-			// Phase implémentation → même modèle (sauf s'il a été banni entre-temps).
-			if (state?.phase === "impl" && !permanentDenylist.has(`${state.providerId}/${state.modelId}`)) {
-				const m = ctx.modelRegistry.find(state.providerId, state.modelId);
-				if (m) {
-					const th = capThinking(state.thinking, request.thinkingLevel as Thinking);
-					return toRoute(ctx, m, th, state);
-				}
-			}
-
-			// Premier edit/write réussi → bascule implémentation (léger).
-			if (editedThisTurn(request.messages)) {
-				const eco = buildTiers(ctx, state?.avoid ?? []).eco;
-				return toRoute(
-					ctx,
-					eco,
-					capThinking("medium", request.thinkingLevel as Thinking),
-					{
+				// Premier edit/write réussi au cours de ce tour → bascule unique en phase "impl" (eco).
+				if (prevState.phase !== "impl" && editedThisTurn(request.messages)) {
+					const eco = buildTiers(ctx, avoid).eco;
+					const th = capThinking("medium", userCap);
+					return toRoute(pi, ctx, eco, th, prevState, {
 						phase: "impl",
 						modelId: eco.id,
 						providerId: eco.provider,
-						thinking: "medium",
-						avoid: state?.avoid ?? [],
-					},
-				);
+						thinking: th,
+						avoid,
+					});
+				}
+
+				// Sinon (phase "start" après read/bash, ou déjà en phase "impl"),
+				// on conserve le même modèle pour préserver le cache de prompt et la liste `avoid`.
+				const currentKey = modelKey({ provider: prevState.providerId, id: prevState.modelId });
+				if (!permanentDenylist.has(currentKey) && !avoid.includes(currentKey)) {
+					const m = ctx.modelRegistry.find(prevState.providerId, prevState.modelId) as
+						| Model<never>
+						| undefined;
+					if (m) {
+						const th = capThinking(prevState.thinking, userCap);
+						return toRoute(pi, ctx, m, th, prevState, { ...prevState, thinking: th });
+					}
+				}
 			}
 
-			// Nouveau tour → difficulté → palier + thinking (plafonné).
+			// ---- NOUVEAU TOUR (`reason === "user"`, ou repli si modèle banni) ----
+			// Si on vient d'un `continuation` dont le modèle a été banni, on garde `avoid` du tour ;
+			// pour un nouveau message utilisateur (`reason === "user"`), on repart avec `avoid: []`.
+			const avoid = request.reason === "user" ? [] : (prevState?.avoid ?? []);
 			const score = difficultyScore(lastUserText(request.messages));
-			const tier = tierFor(score);
-			const autoTh: Thinking =
-				score >= 0.7 ? "xhigh" : score >= 0.45 ? "high" : score >= 0.25 ? "medium" : "low";
-			const th = capThinking(autoTh, request.thinkingLevel as Thinking);
-			const m = buildTiers(ctx, state?.avoid ?? [])[tier];
-			return toRoute(ctx, m, th, {
+			const { tier, thinking: autoTh } = tierAndThinking(score);
+			const th = capThinking(autoTh, userCap);
+			const m = buildTiers(ctx, avoid)[tier];
+			return toRoute(pi, ctx, m, th, prevState, {
 				phase: "start",
 				modelId: m.id,
 				providerId: m.provider,
 				thinking: th,
-				avoid: [],
+				avoid,
 			});
 		},
 	});

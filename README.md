@@ -53,8 +53,8 @@ automatique sur le suivant ; si tout échoue, message explicite.
 # à la session :
 pi -e /chemin/vers/auto-route.ts
 
-# ou permanent :
-pi --set-default-extension /chemin/vers/auto-route.ts   # vérifier la syntaxe : pi --help
+# ou permanent (chargé automatiquement au démarrage de pi) :
+cp /chemin/vers/auto-route.ts ~/.pi/agent/extensions/auto-route.ts
 ```
 
 Puis `/model` → **auto → auto** (affiché « Auto (routage + thinking auto) »).
