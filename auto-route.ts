@@ -389,23 +389,41 @@ export async function classifyTier(
 	signal?: AbortSignal,
 ): Promise<TierDecision | undefined> {
 	try {
-		const models = await ctx.modelRegistry.getAvailableOfType("classifier");
-		if (!models || models.length === 0) return undefined;
+		const available = (await ctx.modelRegistry.getAvailableOfType("classifier")) ?? [];
+		const candidates: Array<{ model: (typeof available)[number]; apiKey?: string }> =
+			available.map((model) => ({ model }));
+		// OpenCode's free classifier (opencode/jev-1.13-free) lives under the
+		// "opencode" provider in pi's catalog, yet accepts an "opencode-go" key
+		// at zero cost. Passing that key per request unlocks Jev for Go users
+		// without enabling "opencode" globally (which would flood /model with
+		// pay-as-you-go Zen chat models that fail with HTTP 402).
+		if (!candidates.some((c) => c.model.provider === "opencode")) {
+			const freeOc = (ctx.modelRegistry.getModelsOfType?.("classifier", "opencode") ?? []).filter(
+				(m) => m.cost?.input === 0,
+			);
+			if (freeOc.length > 0) {
+				const goKey = await ctx.modelRegistry.getApiKeyForProvider?.("opencode-go");
+				if (goKey) {
+					for (const model of freeOc) candidates.push({ model, apiKey: goKey });
+				}
+			}
+		}
+		if (candidates.length === 0) return undefined;
 		// Free classifiers first, then ascending input cost; unknown pricing
 		// ranks last. Array sort is stable, so the catalog order survives.
-		const model = [...models].sort((a, b) => {
-			const freeA = a.cost?.input === 0;
-			const freeB = b.cost?.input === 0;
+		const picked = [...candidates].sort((a, b) => {
+			const freeA = a.model.cost?.input === 0;
+			const freeB = b.model.cost?.input === 0;
 			if (freeA !== freeB) return freeA ? -1 : 1;
 			return (
-				(a.cost?.input ?? Number.POSITIVE_INFINITY) -
-				(b.cost?.input ?? Number.POSITIVE_INFINITY)
+				(a.model.cost?.input ?? Number.POSITIVE_INFINITY) -
+				(b.model.cost?.input ?? Number.POSITIVE_INFINITY)
 			);
 		})[0];
-		if (!model) return undefined;
+		if (!picked) return undefined;
 		const timeoutSignal = AbortSignal.timeout(4_000);
 		const result = await ctx.modelRegistry.classify(
-			model,
+			picked.model,
 			{
 				state: { prompt: text.slice(0, 16_000) },
 				questions: {
@@ -422,7 +440,10 @@ export async function classifyTier(
 					},
 				},
 			},
-			{ signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal },
+			{
+				signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
+				...(picked.apiKey ? { apiKey: picked.apiKey } : {}),
+			},
 		);
 		if (result.stopReason !== "stop") return undefined;
 		const answer = result.answers?.difficulty;
@@ -431,7 +452,7 @@ export async function classifyTier(
 		if (!decision) return undefined;
 		const probability = answer.probabilities[answer.choice] ?? answer.confidence ?? 0;
 		if (probability < 0.5) return undefined;
-		return { ...decision, via: modelKey(model) };
+		return { ...decision, via: modelKey(picked.model) };
 	} catch {
 		return undefined;
 	}

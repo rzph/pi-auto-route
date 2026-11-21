@@ -147,3 +147,20 @@ test("an already-aborted signal does not stop the classify call", async () => {
 	await classifyTier(ctx, "a message of average difficulty", controller.signal);
 	assert.equal(calls.length, 1, "classify must still be called under an aborted signal");
 });
+
+test("free opencode classifier borrows the opencode-go key when opencode is unconfigured", async () => {
+	const { ctx, calls } = loadCtx([]);
+	ctx.modelRegistry.getModelsOfType = (type: string, provider?: string) =>
+		type === "classifier" && provider === "opencode"
+			? [fakeModel("opencode", "jev-1.13", 0.042), fakeModel("opencode", "jev-1.13-free", 0)]
+			: [];
+	ctx.modelRegistry.getApiKeyForProvider = async (provider: string) =>
+		provider === "opencode-go" ? "oc_sk_go_test" : undefined;
+
+	const decision = await classifyTier(ctx, "refactor the authentication pipeline");
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0].model.id, "jev-1.13-free", "only the zero-cost opencode classifier is borrowed");
+	assert.equal(calls[0].options.apiKey, "oc_sk_go_test", "the opencode-go key is passed per request");
+	assert.deepEqual(decision, { tier: "strong", thinking: "high", via: "opencode/jev-1.13-free" });
+});
+

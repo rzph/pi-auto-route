@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.3.2
+
+- OpenCode Go subscribers now get `opencode/jev-1.13-free` classification out of the box without configuring the `opencode` Zen provider globally (which would otherwise expose pay-as-you-go chat models that fail with HTTP 402).
+
 ## 1.3.1
 
 - npm version badge and package link in the README.
