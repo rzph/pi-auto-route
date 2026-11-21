@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.3
+
+- Any configured provider key can unlock a free classifier, not just `opencode-go`: the router scans every provider holding a key (`getAll` + `getApiKeyForProvider`) and tries them in order, so an OpenCode key sitting under an unexpected provider name is found too.
+- A key the classifier rejects now falls through to the next candidate instead of silently dropping to the local heuristic.
+- README: new "Free classifiers and borrowed keys" section, including the limit — OpenCode validates the credential itself, so a Google key gets 401 and never unlocks Jev.
+
 ## 1.3.2
 
 - OpenCode Go subscribers now get `opencode/jev-1.13-free` classification out of the box without configuring the `opencode` Zen provider globally (which would otherwise expose pay-as-you-go chat models that fail with HTTP 402).
