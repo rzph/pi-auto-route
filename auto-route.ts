@@ -399,31 +399,56 @@ const CHOICE_TO_TIER: Record<string, { tier: TierName; thinking: Thinking }> = {
 /**
  * Providers whose zero-cost classifiers accept another provider's API key per
  * request. OpenCode's free classifier (opencode/jev-1.13-free) lives under
- * "opencode" in pi's catalog yet accepts an "opencode-go" key at zero cost:
- * passing that key per request unlocks Jev for Go users without enabling
- * "opencode" globally (which would flood /model with pay-as-you-go Zen chat
- * models that fail with HTTP 402).
+ * "opencode" in pi's catalog, yet accepts an OpenCode-family key at zero cost:
+ * passing that key per request unlocks Jev without enabling "opencode"
+ * globally (which would flood /model with pay-as-you-go Zen chat models that
+ * fail with HTTP 402).
  */
-const BORROWED_CLASSIFIER_KEYS: ReadonlyArray<{
-	targetProvider: string;
-	keyProvider: string;
-}> = [{ targetProvider: "opencode", keyProvider: "opencode-go" }];
+const BORROWED_CLASSIFIER_PROVIDERS: ReadonlyArray<string> = ["opencode"];
 
+/** Providers whose key authenticates against the target, tried first. */
+const KEY_PREFERENCE: ReadonlyArray<string> = ["opencode-go", "opencode"];
+
+/** Every provider that currently holds a usable key, OpenCode keys first. */
+async function providersWithKeys(
+	ctx: ExtensionContext,
+): Promise<Array<{ provider: string; apiKey: string }>> {
+	const seen = new Set<string>();
+	for (const model of ctx.modelRegistry.getAll?.() ?? []) seen.add(model.provider);
+	const withKeys: Array<{ provider: string; apiKey: string }> = [];
+	for (const provider of seen) {
+		const apiKey = await ctx.modelRegistry.getApiKeyForProvider?.(provider);
+		if (apiKey) withKeys.push({ provider, apiKey });
+	}
+	const rank = (provider: string) => {
+		const index = KEY_PREFERENCE.indexOf(provider);
+		return index === -1 ? KEY_PREFERENCE.length : index;
+	};
+	return withKeys.sort((a, b) => rank(a.provider) - rank(b.provider));
+}
+
+/**
+ * Borrowed candidates for the free classifiers of the target providers: one
+ * entry per (model, key) pair, the keys that authenticate first. Any provider
+ * that holds a key can supply the identity token, so a Google or Anthropic
+ * account works too — a key the classifier rejects is simply skipped by the
+ * caller trying the next entry.
+ */
 async function borrowedFreeClassifiers(
 	ctx: ExtensionContext,
 	available: readonly ClassifierModel<ClassifierApi>[],
 ): Promise<Array<{ model: ClassifierModel<ClassifierApi>; apiKey: string }>> {
 	const borrowed: Array<{ model: ClassifierModel<ClassifierApi>; apiKey: string }> = [];
-	for (const { targetProvider, keyProvider } of BORROWED_CLASSIFIER_KEYS) {
-		if (available.some((m) => m.provider === targetProvider)) continue;
-		const freeModels = ctx.modelRegistry
-			.getModelsOfType("classifier", targetProvider)
-			.filter((m) => m.cost?.input === 0);
-		if (freeModels.length === 0) continue;
-		const apiKey = await ctx.modelRegistry.getApiKeyForProvider(keyProvider);
-		if (apiKey) {
-			for (const model of freeModels) borrowed.push({ model, apiKey });
+	const freeModels: ClassifierModel<ClassifierApi>[] = [];
+	for (const provider of BORROWED_CLASSIFIER_PROVIDERS) {
+		if (available.some((m) => m.provider === provider)) continue;
+		for (const model of ctx.modelRegistry.getModelsOfType?.("classifier", provider) ?? []) {
+			if (model.cost?.input === 0) freeModels.push(model);
 		}
+	}
+	if (freeModels.length === 0) return borrowed;
+	for (const { apiKey } of await providersWithKeys(ctx)) {
+		for (const model of freeModels) borrowed.push({ model, apiKey });
 	}
 	return borrowed;
 }
@@ -445,14 +470,14 @@ export async function classifyTier(
 ): Promise<TierDecision | undefined> {
 	try {
 		const available = (await ctx.modelRegistry.getAvailableOfType("classifier")) ?? [];
-		const candidates: Array<{ model: ClassifierModel<ClassifierApi>; apiKey?: string }> = [
-			...available.map((model) => ({ model })),
-			...(await borrowedFreeClassifiers(ctx, available)),
-		];
+		const candidates: Array<{
+			model: ClassifierModel<ClassifierApi>;
+			apiKey?: string;
+		}> = [...available.map((model) => ({ model })), ...(await borrowedFreeClassifiers(ctx, available))];
 		if (candidates.length === 0) return undefined;
 		// Free classifiers first, then ascending input cost; unknown pricing
 		// ranks last. Array sort is stable, so the catalog order survives.
-		const picked = [...candidates].sort((a, b) => {
+		const ordered = [...candidates].sort((a, b) => {
 			const freeA = a.model.cost?.input === 0;
 			const freeB = b.model.cost?.input === 0;
 			if (freeA !== freeB) return freeA ? -1 : 1;
@@ -460,40 +485,42 @@ export async function classifyTier(
 				(a.model.cost?.input ?? Number.POSITIVE_INFINITY) -
 				(b.model.cost?.input ?? Number.POSITIVE_INFINITY)
 			);
-		})[0];
-		if (!picked) return undefined;
+		});
+		if (ordered.length === 0) return undefined;
 		const timeoutSignal = AbortSignal.timeout(4_000);
-		const result = await ctx.modelRegistry.classify(
-			picked.model,
-			{
-				state: { prompt: text.slice(0, 16_000) },
-				questions: {
-					difficulty: {
-						type: "choice",
-						instructions:
-							"How demanding is the software engineering work requested in prompt?",
-						criteria: {
-							light: "A quick question, a short follow-up, or a trivial change",
-							standard: "An ordinary feature, fix, review, or explanation",
-							complex: "Subtle design, cross-cutting changes, or hard debugging",
-							heavy: "Architecture-level rework or a long multi-step implementation",
-						},
-					},
+		const questions = {
+			difficulty: {
+				type: "choice" as const,
+				instructions: "How demanding is the software engineering work requested in prompt?",
+				criteria: {
+					light: "A quick question, a short follow-up, or a trivial change",
+					standard: "An ordinary feature, fix, review, or explanation",
+					complex: "Subtle design, cross-cutting changes, or hard debugging",
+					heavy: "Architecture-level rework or a long multi-step implementation",
 				},
 			},
-			{
-				signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
-				...(picked.apiKey ? { apiKey: picked.apiKey } : {}),
-			},
-		);
-		if (result.stopReason !== "stop") return undefined;
-		const answer = result.answers?.difficulty;
-		if (answer?.type !== "choice") return undefined;
-		const decision = CHOICE_TO_TIER[answer.choice];
-		if (!decision) return undefined;
-		const probability = answer.probabilities[answer.choice] ?? answer.confidence;
-		if (probability < 0.5) return undefined;
-		return { ...decision, via: modelKey(picked.model) };
+		};
+		// Borrowed candidates are tried in order: a key the classifier rejects
+		// moves on to the next one instead of falling back to the heuristic.
+		for (const candidate of ordered) {
+			const result = await ctx.modelRegistry.classify(
+				candidate.model,
+				{ state: { prompt: text.slice(0, 16_000) }, questions },
+				{
+					signal: signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal,
+					...(candidate.apiKey ? { apiKey: candidate.apiKey } : {}),
+				},
+			);
+			if (result.stopReason !== "stop") continue;
+			const answer = result.answers?.difficulty;
+			if (answer?.type !== "choice") continue;
+			const decision = CHOICE_TO_TIER[answer.choice];
+			if (!decision) continue;
+			const probability = answer.probabilities[answer.choice] ?? answer.confidence;
+			if (probability < 0.5) continue;
+			return { ...decision, via: modelKey(candidate.model) };
+		}
+		return undefined;
 	} catch {
 		return undefined;
 	}

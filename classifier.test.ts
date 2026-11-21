@@ -62,6 +62,7 @@ function loadCtx(
 			requestedTypes.push(type);
 			return models;
 		},
+		getAll: () => [],
 		getModelsOfType: () => [],
 		getApiKeyForProvider: async () => undefined,
 		classify,
@@ -152,6 +153,7 @@ test("an already-aborted signal does not stop the classify call", async () => {
 
 test("free opencode classifier borrows the opencode-go key when opencode is unconfigured", async () => {
 	const { ctx, calls } = loadCtx([]);
+	ctx.modelRegistry.getAll = () => [fakeModel("opencode-go", "glm-5.3", 0.5)];
 	ctx.modelRegistry.getModelsOfType = (type: string, provider?: string) =>
 		type === "classifier" && provider === "opencode"
 			? [fakeModel("opencode", "jev-1.13", 0.042), fakeModel("opencode", "jev-1.13-free", 0)]
@@ -164,5 +166,55 @@ test("free opencode classifier borrows the opencode-go key when opencode is unco
 	assert.equal(calls[0].model.id, "jev-1.13-free", "only the zero-cost opencode classifier is borrowed");
 	assert.equal(calls[0].options.apiKey, "oc_sk_go_test", "the opencode-go key is passed per request");
 	assert.deepEqual(decision, { tier: "strong", thinking: "high", via: "opencode/jev-1.13-free" });
+});
+
+test("any configured provider key can be borrowed when no opencode key exists", async () => {
+	const { ctx, calls } = loadCtx([]);
+	ctx.modelRegistry.getAll = () => [fakeModel("google", "gemini-3-flash", 0.3)];
+	ctx.modelRegistry.getModelsOfType = (type: string, provider?: string) =>
+		type === "classifier" && provider === "opencode"
+			? [fakeModel("opencode", "jev-1.13-free", 0)]
+			: [];
+	ctx.modelRegistry.getApiKeyForProvider = async (provider: string) =>
+		provider === "google" ? "google_key_abc" : undefined;
+
+	const decision = await classifyTier(ctx, "refactor the authentication pipeline");
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0].options.apiKey, "google_key_abc", "the google key supplies the identity");
+	assert.equal(decision?.via, "opencode/jev-1.13-free");
+});
+
+test("a borrowed key the classifier rejects falls through to the next one", async () => {
+	const impl = (_model: any, _context: any, options: any) =>
+		options.apiKey === "key_aaa"
+			? { stopReason: "error", errorMessage: "401 invalid credentials", answers: {} }
+			: fakeResult("standard", 0.9);
+	const { ctx, calls } = loadCtx([], impl);
+	ctx.modelRegistry.getAll = () => [
+		fakeModel("aaa", "model-a", 0.1),
+		fakeModel("bbb", "model-b", 0.1),
+	];
+	ctx.modelRegistry.getModelsOfType = (type: string, provider?: string) =>
+		type === "classifier" && provider === "opencode"
+			? [fakeModel("opencode", "jev-1.13-free", 0)]
+			: [];
+	ctx.modelRegistry.getApiKeyForProvider = async (provider: string) =>
+		provider === "aaa" ? "key_aaa" : provider === "bbb" ? "key_bbb" : undefined;
+
+	const decision = await classifyTier(ctx, "refactor the authentication pipeline");
+	assert.equal(calls.length, 2, "the rejected key must not end the classification");
+	assert.equal(calls[0].options.apiKey, "key_aaa");
+	assert.equal(calls[1].options.apiKey, "key_bbb", "the next key gets its turn");
+	assert.equal(decision?.via, "opencode/jev-1.13-free");
+});
+
+test("no borrowed key and no classifier yields no decision", async () => {
+	const { ctx, calls } = loadCtx([]);
+	ctx.modelRegistry.getModelsOfType = (type: string, provider?: string) =>
+		type === "classifier" && provider === "opencode"
+			? [fakeModel("opencode", "jev-1.13-free", 0)]
+			: [];
+	assert.equal(await classifyTier(ctx, "a message of average difficulty"), undefined);
+	assert.equal(calls.length, 0, "nothing is called without a usable key");
 });
 
