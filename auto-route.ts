@@ -50,7 +50,6 @@ type TierName = "frontier" | "strong" | "standard" | "eco";
 const THINKING_ORDER: Thinking[] = ["off", "low", "medium", "high", "xhigh"];
 
 interface RouteState {
-	phase: "start" | "impl";
 	modelId: string;
 	providerId: string;
 	thinking: Thinking;
@@ -65,7 +64,6 @@ function modelKey(m: { provider: string; id: string }): string {
 function sameState(a: RouteState | undefined, b: RouteState): boolean {
 	if (!a) return false;
 	return (
-		a.phase === b.phase &&
 		a.modelId === b.modelId &&
 		a.providerId === b.providerId &&
 		a.thinking === b.thinking &&
@@ -211,13 +209,17 @@ const WANT = /\b(je veux|fais en sorte|fais[- ]moi|il faut|on pourrait|peux[- ]t
 /** Question conceptuelle → demande d'explication de bon niveau. */
 const QUESTION =
 	/\b(pourquoi|explique\w*|c'est quoi|c est quoi|comment (?:ça|ca) marche|diff[ée]rence entre|quelle est|quel est|est[- ]ce que)\b/i;
+/** Mots-clés concepts, comptés (jusqu'à 3). */
+const CONCEPTS =
+	/\b(architecture|conception|refactor|d[ée]bogu|debug|optimis|s[ée]curit|timing|algorithme|compar|pourquoi|analyse|syst[èe]me|protocole)\b/gi;
+/** Déclaration de panne / régression explicite. */
+const REGRESSION = /\b(pas le m[êe]me|r[ée]gression|cass[ée]|fuit|bloqu[ée]|corriger)\b/i;
+/** Ligne de prompt shell (copier-coller de terminal : forme, pas difficulté). */
+const SHELLLINE = /^\s*(?:\$|sudo\s|#\s)/gm;
 
 export function difficultyScore(text: string): number {
 	const t = text.trim();
-	const kw = t.match(
-		/\b(architecture|conception|refactor|d[ée]bogu|debug|optimis|s[ée]curit|timing|algorithme|compar|pourquoi|analyse|syst[èe]me|protocole)\b/gi,
-	);
-	let sig = Math.min(0.3, (kw?.length ?? 0) * 0.1);
+	let sig = Math.min(0.3, ((t.match(CONCEPTS) ?? []).length) * 0.1);
 	if (PATHY.test(t)) sig += 0.25;
 	if (ACTION.test(t)) sig += 0.2;
 	if (WANT.test(t)) sig += 0.1;
@@ -225,10 +227,9 @@ export function difficultyScore(text: string): number {
 	if (t.includes("```")) sig += 0.1;
 	if (t.length > 800) sig += 0.1;
 	if (t.length > 2000) sig += 0.1;
-	if (/\b(pas le m[êe]me|r[ée]gression|cass[ée]|fuit|bloqu[ée]|corriger)\b/i.test(t)) sig += 0.1;
+	if (REGRESSION.test(t)) sig += 0.1;
 	// Copier-coller de terminal (≥3 lignes de prompt shell) : forme, pas difficulté.
-	const shellLines = (t.match(/^\s*(?:\$|sudo\s|#\s)/gm) ?? []).length;
-	if (shellLines >= 3) sig -= 0.15;
+	if ((t.match(SHELLLINE) ?? []).length >= 3) sig -= 0.15;
 	// Base 0.10 : relance courte et message neutre → palier le plus léger.
 	return Math.round(Math.min(1, 0.1 + Math.max(0, sig)) * 100) / 100;
 }
@@ -266,6 +267,31 @@ function editedThisTurn(messages: readonly Message[]): boolean {
 				EDIT_TOOLS.has((m as { toolName?: string }).toolName ?? "") &&
 				!(m as { isError?: boolean }).isError,
 		);
+}
+
+/**
+ * Point d'entrée commun au nouveau tour et au repli de secours d'une continuation
+ * (modèle courant banni/introuvable) : difficulté du message courant → palier.
+ * `avoid` vide pour un nouveau tour, conservé pour un re-routage de secours.
+ */
+function rerouteCurrentTurn(
+	pi: ExtensionAPI,
+	ctx: ExtensionContext,
+	request: Req,
+	avoid: string[],
+	userCap: Thinking,
+	prevState?: RouteState,
+): ModelRoute<RouteState> {
+	const score = difficultyScore(lastUserText(request.messages));
+	const { tier, thinking: autoTh } = tierAndThinking(score);
+	const th = capThinking(autoTh, userCap);
+	const m = buildTiers(ctx, avoid)[tier];
+	return toRoute(pi, ctx, m, th, prevState, {
+		modelId: m.id,
+		providerId: m.provider,
+		thinking: th,
+		avoid,
+	});
 }
 
 export default function (pi: ExtensionAPI) {
@@ -308,7 +334,6 @@ export default function (pi: ExtensionAPI) {
 					banPermanently(request.failed.model.provider, request.failed.model.id);
 				}
 				const baseState: RouteState = prevState ?? {
-					phase: "start",
 					modelId: request.failed.model.id,
 					providerId: request.failed.model.provider,
 					thinking: (request.failed.thinkingLevel ?? "medium") as Thinking,
@@ -335,12 +360,13 @@ export default function (pi: ExtensionAPI) {
 			if (request.reason === "continuation" && prevState) {
 				const avoid = prevState.avoid ?? [];
 
-				// Premier edit/write réussi au cours de ce tour → bascule unique en phase "impl" (eco).
-				if (prevState.phase !== "impl" && editedThisTurn(request.messages)) {
+				// Premier edit/write réussi du tour → bascule sur le palier eco jusqu'à la fin
+				// du tour (editedThisTurn reste vrai : les toolResult s'accumulent).
+				if (editedThisTurn(request.messages)) {
 					const eco = buildTiers(ctx, avoid).eco;
 					const th = capThinking("medium", userCap);
 					return toRoute(pi, ctx, eco, th, prevState, {
-						phase: "impl",
+						...prevState,
 						modelId: eco.id,
 						providerId: eco.provider,
 						thinking: th,
@@ -348,8 +374,8 @@ export default function (pi: ExtensionAPI) {
 					});
 				}
 
-				// Sinon (phase "start" après read/bash, ou déjà en phase "impl"),
-				// on conserve le même modèle pour préserver le cache de prompt et la liste `avoid`.
+				// Pas d'edit → on garde le modèle courant pour préserver le cache de prompt
+				// et la liste `avoid` ; s'il a été banni entre-temps, repli de secours ci-dessous.
 				const currentKey = modelKey({ provider: prevState.providerId, id: prevState.modelId });
 				if (!permanentDenylist.has(currentKey) && !avoid.includes(currentKey)) {
 					const m = ctx.modelRegistry.find(prevState.providerId, prevState.modelId) as
@@ -360,23 +386,13 @@ export default function (pi: ExtensionAPI) {
 						return toRoute(pi, ctx, m, th, prevState, { ...prevState, thinking: th });
 					}
 				}
+				// Repli de secours : modèle courant banni/introuvable → re-routage du MÊME tour
+				// (difficultyScore sur le message courant, `avoid` conservé).
+				return rerouteCurrentTurn(pi, ctx, request, prevState.avoid, userCap, prevState);
 			}
 
-			// ---- NOUVEAU TOUR (`reason === "user"`, ou repli si modèle banni) ----
-			// Si on vient d'un `continuation` dont le modèle a été banni, on garde `avoid` du tour ;
-			// pour un nouveau message utilisateur (`reason === "user"`), on repart avec `avoid: []`.
-			const avoid = request.reason === "user" ? [] : (prevState?.avoid ?? []);
-			const score = difficultyScore(lastUserText(request.messages));
-			const { tier, thinking: autoTh } = tierAndThinking(score);
-			const th = capThinking(autoTh, userCap);
-			const m = buildTiers(ctx, avoid)[tier];
-			return toRoute(pi, ctx, m, th, prevState, {
-				phase: "start",
-				modelId: m.id,
-				providerId: m.provider,
-				thinking: th,
-				avoid,
-			});
+			// ---- NOUVEAU TOUR (message utilisateur) ----
+			return rerouteCurrentTurn(pi, ctx, request, [], userCap, prevState);
 		},
 	});
 }

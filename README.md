@@ -23,8 +23,14 @@ Sélectionne **auto → auto** dans le sélecteur de modèles (`/model`). Ensuit
    intention (« je veux »), question conceptuelle, mots-clés (débogage,
    architecture…), longueur, code, pénalité copier-coller de terminal →
    un score continu de 0 à 1. Calibrée sur 880 tours réels (voir
-   `heuristics.test.ts`) : Spearman score↔outils +0.16 → +0.28 ;
-   messages les plus lourds envoyés en `eco` : 195/220 → 72/220.
+   `heuristics.test.ts`) — chiffres à lire honnêtement :
+   - messages du quartile le plus lourd envoyés en `eco` :
+     **195/220 → 72/220** (le vrai gain : moins de sous-routage) ;
+   - Spearman score↔outils : +0.16 → **+0.28** ;
+   - accord quartile global : **30 % contre 25 % pour le hasard** — le
+     score est un *parapluie asymétrique* (protège les messages lourds du
+     palier `eco`, remonte les simples d'un cran au pire), pas un
+     classifieur précis. Ne pas sur-estimer la prédiction fine.
 2. **Choix du palier** dans TON catalogue réel (découvert au runtime via
    `getAvailable()`, rien n'est codé en dur) :
 
@@ -45,7 +51,17 @@ Sélectionne **auto → auto** dans le sélecteur de modèles (`/model`). Ensuit
 
 - les modèles **gratuits** (quota/timeout : sources de tours ratés) ;
 - les modèles **non-reasoning** ;
-- tout modèle dont le provider n'a pas de credentials valides.
+- tout modèle dont le provider n'a pas de credentials valides ;
+- les modèles **`contributor`** (endpoints OpenCode qui entraînent sur tes
+  requêtes) ;
+- les générations retirées ou dépréciées : `gemini-2.5-*` (404 Google),
+  `mimo-v2.5` (410 OpenCode) ;
+- les modèles spécialisés non-code (`computer-use`, `robotics`,
+  `deep-research`) ;
+- tout modèle inscrit dans `~/.pi/agent/auto-route-denylist.json` —
+  banni automatiquement et **persistemment** dès qu'il renvoie une erreur
+  définitive (400/404/410, « trains on request data », région non
+  autorisée…). Supprime une entrée du fichier pour rétablir un modèle.
 
 Le classement par capacité utilise le **coût de sortie** comme proxy (à coût
 égal, le plus grand contextWindow gagne). Si un palier est vide, repli
