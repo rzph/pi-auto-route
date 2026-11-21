@@ -19,17 +19,21 @@ Sélectionne **auto → auto** dans le sélecteur de modèles (`/model`). Ensuit
 à chaque tour :
 
 1. **Estimation de difficulté** (heuristique locale, aucune API externe) :
-   mots-clés (débogage, architecture, optimisation…), longueur du message,
-   présence de code → un score continu de 0 à 1.
+   chemin/dépôt cité, verbes d'action (« reprend », « modifie », « trouve »…),
+   intention (« je veux »), question conceptuelle, mots-clés (débogage,
+   architecture…), longueur, code, pénalité copier-coller de terminal →
+   un score continu de 0 à 1. Calibrée sur 880 tours réels (voir
+   `heuristics.test.ts`) : Spearman score↔outils +0.16 → +0.28 ;
+   messages les plus lourds envoyés en `eco` : 195/220 → 72/220.
 2. **Choix du palier** dans TON catalogue réel (découvert au runtime via
    `getAvailable()`, rien n'est codé en dur) :
 
    | Score | Palier | Thinking |
    |---|---|---|
-   | ≥ 0.7 — archi, debug dur, gros code | le plus capable | `xhigh` |
-   | ≥ 0.45 | fort | `high` |
-   | ≥ 0.25 | standard | `medium` |
-   | < 0.25 | léger | `low` |
+   | ≥ 0.7 — chantier lourd, signaux multiples | le plus capable | `xhigh` |
+   | ≥ 0.5 | fort | `high` |
+   | ≥ 0.3 | standard | `medium` |
+   | < 0.3 — relances, questions courtes | léger | `low` |
 
 3. **Une bascule maximum par tour** : le modèle de départ planifie et fait
    son premier `edit`/`write` ; ensuite le tour continue sur le modèle le
@@ -63,7 +67,9 @@ Puis `/model` → **auto → auto** (affiché « Auto (routage + thinking auto) 
 
 Tout se règle en tête de fichier :
 
-- `difficultyScore()` : l'heuristique (mots-clés, seuils de longueur) ;
+- `difficultyScore()` : l'heuristique (signaux + seuils de longueur) —
+  chaque signal est un bout de regex commenté ; recalibre et relance
+  `node --test heuristics.test.ts` après modification ;
 - `tierAndThinking()` : la correspondance score → palier + thinking ;
 - le filtre de `candidateModels()` si tu veux réintégrer les modèles
   gratuits ou non-reasoning.
