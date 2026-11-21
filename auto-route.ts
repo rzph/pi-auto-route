@@ -3,22 +3,22 @@
  *
  * /model → « auto » :
  * - candidats = modèles chat reasoning payants, credentials valides,
- *   moins les fournisseurs exclus (voir EXCLUDED_PROVIDERS) ;
- * - paliers de capacité au runtime (coût de sortie ≈ proxy) ;
+ *   hors modèles gratuits (`free`), modèles d'entraînement (`contributor`),
+ *   et générations retirées (`gemini-2.5-*`) ;
+ * - paliers de capacité construits au runtime (coût de sortie ≈ proxy) ;
  * - difficulté estimée localement → palier + thinking ;
- * - le thinking choisi dans pi agit comme PLAFOND ;
- * - failover : échec → autre modèle du même palier ; 3 échecs → palier
- *   inférieur. Les erreurs « modèle retiré / indisponible » bannissent
- *   le modèle PERSISTAMMENT (fichier denylist partagé entre sessions) ;
- * - UNE ligne de statut max, discrète ;
- * - une bascule de modèle max par tour (cache de prompt) ;
+ * - le thinking choisi dans pi (`shift+tab`) agit comme PLAFOND ;
+ * - failover sur retry (429/5xx) + écoute de `message_end` pour bannir
+ *   PERSISTAMMENT les modèles qui renvoient 400/404 (car pi ne retry pas
+ *   les 4xx autres que 429) ;
+ * - UNE ligne de statut discrète (`⚡ modèle · thinking`) ;
+ * - une bascule de modèle max par tour (cache de prompt préservé) ;
  * - compaction/résumés → le plus léger.
  *
  * Usage : pi -e ~/.pi/agent/extensions/auto-route.ts puis /model → auto
  */
 
-import type { Message } from "@earendil-works/pi-ai";
-import type { Model } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -26,21 +26,24 @@ import type {
 	ModelRouteRequest,
 } from "@earendil-works/pi-coding-agent";
 
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 const EDIT_TOOLS = new Set(["edit", "write"]);
 
-/**
- * Fournisseurs exclus par défaut : AUCUN. L'entraînement sur données chez
- * OpenCode est un réglage PAR MODÈLE, pas par compte — le modèle fautif
- * (« This OpenCode Go model trains on request data ») est banni
- * individuellement par la denylist persistante au premier échec.
- * Ajoute ici un fournisseur entier seulement en connaissance de cause.
- */
+/** Fournisseurs exclus en bloc (aucun par défaut). */
 const EXCLUDED_PROVIDERS = new Set<string>([]);
 
-/** Fichier des modèles bannis définitivement (retirés, 404, …). */
+/**
+ * Motifs d'ID/nom exclus d'office :
+ * - `free` : quotas serrés / timeouts constants ;
+ * - `contributor` : endpoints OpenCode qui entraînent sur tes requêtes ;
+ * - `gemini-2.5-` : retirés par Google pour les nouveaux comptes (404) ;
+ * - `computer-use` / `robotics` / `deep-research` : modèles spécialisés non-code.
+ */
+const EXCLUDED_MODEL_RE = /free|contributor|^gemini-2\.5-|computer-use|robotics|deep-research/i;
+
+/** Fichier des modèles bannis définitivement (400/404 découverts au vol). */
 const DENYLIST_FILE = `${process.env.HOME ?? ""}/.pi/agent/auto-route-denylist.json`;
 
 type Thinking = "off" | "low" | "medium" | "high" | "xhigh";
@@ -79,9 +82,17 @@ function saveDenylist(set: Set<string>): void {
 
 const permanentDenylist = loadDenylist();
 
-/** Erreur définitive (modèle retiré, indisponible) vs transitoire (timeout…). */
+function banPermanently(provider: string, modelId: string): void {
+	const k = `${provider}/${modelId}`;
+	if (!permanentDenylist.has(k)) {
+		permanentDenylist.add(k);
+		saveDenylist(permanentDenylist);
+	}
+}
+
+/** Erreur définitive (modèle retiré, 404, refuse sans training, …). */
 function isPermanentFailure(message: string): boolean {
-	return /no longer available|not found|invalid_request_error|does not exist|deprecated|discontinued/i.test(
+	return /no longer available|not found|404|trains on request data|invalid_request_error|does not exist|deprecated|discontinued|unsupported/i.test(
 		message,
 	);
 }
@@ -92,17 +103,18 @@ function candidateModels(ctx: ExtensionContext): Model<never>[] {
 	const excluded = new Set([...EXCLUDED_PROVIDERS, ...permanentDenylist]);
 	return (ctx.modelRegistry.getAvailable() as Model<never>[]).filter((m) => {
 		if (excluded.has(m.provider) || excluded.has(`${m.provider}/${m.id}`)) return false;
-		const free =
-			/free/i.test(m.name) ||
-			/free/i.test(m.id) ||
-			(!m.cost || (m.cost.input === 0 && m.cost.output === 0));
-		return m.reasoning !== false && !free;
+		if (EXCLUDED_MODEL_RE.test(m.id) || EXCLUDED_MODEL_RE.test(m.name)) return false;
+		const zeroCost = !m.cost || (m.cost.input === 0 && m.cost.output === 0);
+		return m.reasoning !== false && !zeroCost;
 	});
 }
 
 function buildTiers(ctx: ExtensionContext, avoid: string[] = []) {
 	let pool = candidateModels(ctx).filter((m) => !avoid.includes(`${m.provider}/${m.id}`));
 	if (pool.length === 0) pool = candidateModels(ctx);
+	if (pool.length === 0) {
+		throw new Error("auto-route : aucun modèle candidat disponible (vérifie tes clés API)");
+	}
 	const sorted = [...pool].sort((a, b) => {
 		const ca = a.cost?.output ?? 0;
 		const cb = b.cost?.output ?? 0;
@@ -122,19 +134,16 @@ function buildTiers(ctx: ExtensionContext, avoid: string[] = []) {
 
 // ---------- Statut (une seule ligne, discrète) ----------
 
-let lastRouted = "—";
 function setStatusLine(ctx: ExtensionContext, m: Model<never>, thinking: Thinking): void {
-	lastRouted = `${m.provider}/${m.id}`;
 	try {
 		const dim = ctx.ui.theme?.fg?.bind(ctx.ui.theme) ?? ((_: string, s: string) => s);
-		ctx.ui.setStatus("auto", dim("dim", `⚡ ${m.id} · ${thinking}`));
+		ctx.ui.setStatus("auto", dim("dim", `⚡ ${m.provider}/${m.id} · ${thinking}`));
 	} catch {
-		ctx.ui.setStatus("auto", `${m.id} · ${thinking}`);
+		ctx.ui.setStatus("auto", `${m.provider}/${m.id} · ${thinking}`);
 	}
 }
 
 function toRoute(
-	request: Req,
 	ctx: ExtensionContext,
 	m: Model<never>,
 	thinking: Thinking,
@@ -206,6 +215,18 @@ function editedThisTurn(messages: readonly Message[]): boolean {
 }
 
 export default function (pi: ExtensionAPI) {
+	// Pi ne déclenche PAS `route(reason: "retry")` sur les erreurs 400/404.
+	// On écoute donc `message_end` pour bannir définitivement le modèle fautif
+	// dès qu'une telle erreur survient.
+	pi.on("message_end", (event) => {
+		const msg = event.message as AssistantMessage;
+		if (msg?.role === "assistant" && msg.stopReason === "error" && msg.errorMessage) {
+			if (isPermanentFailure(msg.errorMessage) && msg.provider && msg.model) {
+				banPermanently(msg.provider, msg.model);
+			}
+		}
+	});
+
 	pi.registerVirtualModel<RouteState>({
 		provider: "auto",
 		id: "auto",
@@ -215,16 +236,14 @@ export default function (pi: ExtensionAPI) {
 		maxTokens: 64_000,
 		async route(request, ctx) {
 			if (request.reason === "direct") {
-				return toRoute(request, ctx, buildTiers(ctx).background, "low");
+				return toRoute(ctx, buildTiers(ctx).background, "low");
 			}
 
-			// ---- RETRY / failover ----
+			// ---- RETRY / failover (429 / 5xx) ----
 			if (request.reason === "retry" && request.failed) {
 				const failedKey = `${request.failed.model.provider}/${request.failed.model.id}`;
-				// Échec définitif → bannissement persistant (toutes sessions).
 				if (isPermanentFailure(request.failed.message?.errorMessage ?? "")) {
-					permanentDenylist.add(failedKey);
-					saveDenylist(permanentDenylist);
+					banPermanently(request.failed.model.provider, request.failed.model.id);
 				}
 				const state: RouteState = request.state ?? {
 					phase: "start",
@@ -242,21 +261,21 @@ export default function (pi: ExtensionAPI) {
 				for (const [tier, th] of ladder) {
 					const m = tiers[tier];
 					if (m && !avoid.includes(`${m.provider}/${m.id}`)) {
-						return toRoute(request, ctx, m, th, { ...state, avoid });
+						return toRoute(ctx, m, th, { ...state, avoid });
 					}
 				}
 				const any = buildTiers(ctx, avoid).frontier;
-				return toRoute(request, ctx, any, state.thinking, { ...state, avoid });
+				return toRoute(ctx, any, state.thinking, { ...state, avoid });
 			}
 
 			const state = request.state;
 
-			// Phase implémentation → même modèle, thinking plafonné.
-			if (state?.phase === "impl") {
+			// Phase implémentation → même modèle (sauf s'il a été banni entre-temps).
+			if (state?.phase === "impl" && !permanentDenylist.has(`${state.providerId}/${state.modelId}`)) {
 				const m = ctx.modelRegistry.find(state.providerId, state.modelId);
 				if (m) {
 					const th = capThinking(state.thinking, request.thinkingLevel as Thinking);
-					return toRoute(request, ctx, m, th, state);
+					return toRoute(ctx, m, th, state);
 				}
 			}
 
@@ -264,7 +283,6 @@ export default function (pi: ExtensionAPI) {
 			if (editedThisTurn(request.messages)) {
 				const eco = buildTiers(ctx, state?.avoid ?? []).eco;
 				return toRoute(
-					request,
 					ctx,
 					eco,
 					capThinking("medium", request.thinkingLevel as Thinking),
@@ -285,7 +303,7 @@ export default function (pi: ExtensionAPI) {
 				score >= 0.7 ? "xhigh" : score >= 0.45 ? "high" : score >= 0.25 ? "medium" : "low";
 			const th = capThinking(autoTh, request.thinkingLevel as Thinking);
 			const m = buildTiers(ctx, state?.avoid ?? [])[tier];
-			return toRoute(request, ctx, m, th, {
+			return toRoute(ctx, m, th, {
 				phase: "start",
 				modelId: m.id,
 				providerId: m.provider,
