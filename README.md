@@ -1,132 +1,77 @@
-# auto-route — modèle virtuel d'économie de tokens pour pi
+# auto-route
 
-Un modèle virtuel qui route automatiquement **vers le bon modèle physique** et
-**ajuste le niveau de thinking**, selon la difficulté estimée de chaque tour de
-conversation. Pensé pour réduire la facture de tokens sans perte de
-performance.
+A virtual model for [pi](https://github.com/earendil-works/pi-coding-agent) that routes every turn to the right physical model by task difficulty and adjusts the thinking level, to cut token spend without losing quality.
 
-![status](https://img.shields.io/badge/harness-pi--coding--agent-blue)
+![harness](https://img.shields.io/badge/harness-pi--coding--agent-blue)
 
-> **⚠️ Spécifique à pi.** Cette extension utilise l'API d'extension de
-> [pi (pi-coding-agent)](https://github.com/earendil-works/pi-coding-agent)
-> (`pi.registerVirtualModel`, `ModelRegistry`). Elle n'est pas portable telle
-> quelle sur Claude Code, Codex ou autres harness — voir
-> [Portabilité](#portabilité) pour les équivalents.
+**pi-specific.** This extension uses pi's extension API (`pi.registerVirtualModel`, `ModelRegistry`). It does not port as-is to Claude Code, Codex or other harnesses; see [Portability](#portability) for close equivalents.
 
-## Ce que ça fait
+## How it works
 
-Sélectionne **auto → auto** dans le sélecteur de modèles (`/model`). Ensuite,
-à chaque tour :
+Pick **auto → auto** in the model selector (`/model`). Then, on every turn:
 
-1. **Estimation de difficulté** (heuristique locale, aucune API externe) :
-   chemin/dépôt cité, verbes d'action (« reprend », « modifie », « trouve »…),
-   intention (« je veux »), question conceptuelle, mots-clés (débogage,
-   architecture…), longueur, code, pénalité copier-coller de terminal →
-   un score continu de 0 à 1. Calibrée sur 880 tours réels (voir
-   `heuristics.test.ts`) — chiffres à lire honnêtement :
-   - messages du quartile le plus lourd envoyés en `eco` :
-     **195/220 → 72/220** (le vrai gain : moins de sous-routage) ;
-   - Spearman score↔outils : +0.16 → **+0.28** ;
-   - accord quartile global : **30 % contre 25 % pour le hasard** — le
-     score est un *parapluie asymétrique* (protège les messages lourds du
-     palier `eco`, remonte les simples d'un cran au pire), pas un
-     classifieur précis. Ne pas sur-estimer la prédiction fine.
-2. **Choix du palier** dans TON catalogue réel (découvert au runtime via
-   `getAvailable()`, rien n'est codé en dur) :
+1. **Difficulty estimate** (local heuristic, no external API): a cited path or repo, action verbs ("resume", "modify", "find"…), explicit intent ("I want"), a conceptual question, keyword matches (debugging, architecture…), length, code, a terminal-paste penalty → a continuous score from 0 to 1. Calibrated on 880 real turns (see `heuristics.test.ts`); read the numbers honestly:
+   - heaviest-quartile messages sent to `eco`: **195/220 → 72/220** (the real win: less under-routing);
+   - Spearman score vs. tool calls: +0.16 → **+0.28**;
+   - overall quartile agreement: **30 % against 25 % for chance** — the score is an *asymmetric umbrella* (it shields heavy messages from the `eco` tier and at worst bumps simple ones one step), not a precise classifier. Do not overestimate fine-grained prediction.
+2. **Tier choice** inside YOUR real catalog (discovered at runtime via `getAvailable()`, nothing hardcoded):
+   - score ≥ 0.7 — heavy work, several signals → most capable tier, thinking `xhigh`
+   - score ≥ 0.5 → strong tier, thinking `high`
+   - score ≥ 0.3 → standard tier, thinking `medium`
+   - score < 0.3 — short follow-ups, quick questions → lightest tier, thinking `low`
+3. **One switch per turn**: the starting model plans and makes the first `edit`/`write`; the rest of the turn continues on the lightest model. The prompt cache breaks only once per turn.
+4. **Compaction and invisible summaries** always go to the lightest model — the token leak nobody sees.
+5. **Automatic failover instead of a crash**: a timeout or overload (429/5xx) moves to the next model of the ladder; a **429 "provider quota"** error (which pi treats as non-retryable) is rewritten into a retryable one, and the router then avoids the **whole provider** — the turn continues instead of dying. Permanent errors (400/404/410) ban the model through the denylist. See `failover.test.ts`.
 
-   | Score | Palier | Thinking |
-   |---|---|---|
-   | ≥ 0.7 — chantier lourd, signaux multiples | le plus capable | `xhigh` |
-   | ≥ 0.5 | fort | `high` |
-   | ≥ 0.3 | standard | `medium` |
-   | < 0.3 — relances, questions courtes | léger | `low` |
+### Excluded from the candidates
 
-3. **Une bascule maximum par tour** : le modèle de départ planifie et fait
-   son premier `edit`/`write` ; ensuite le tour continue sur le modèle le
-   plus léger. Le cache de prompt ne casse qu'une fois par tour.
-4. **Compaction et résumés invisibles** partent systématiquement sur le
-   modèle le plus léger — la fuite de tokens que personne ne voit.
-5. **Failover automatique au lieu d'un plantage** : un timeout/surcharge
-   (429/5xx) bascule sur le modèle suivant du tour ; un **429 « quota
-   fournisseur »** (limite d'abonnement OpenCode, quota Google…) que pi
-   juge non-retryable est réécrit en erreur retryable, et le routeur
-   évite alors **tout le fournisseur** — le tour continue au lieu de
-   mourir. Les erreurs définitives (400/404/410) bannissent le modèle
-   via la denylist. Voir `failover.test.ts`.
+- **free** models (tight quotas, constant timeouts);
+- **non-reasoning** models;
+- any model whose provider has no valid credentials;
+- **`contributor`** models (OpenCode endpoints that train on your requests);
+- retired or deprecated generations: `gemini-2.5-*` (Google 404), `mimo-v2.5` (OpenCode 410);
+- specialized non-code models (`computer-use`, `robotics`, `deep-research`);
+- anything listed in `~/.pi/agent/auto-route-denylist.json` — banned automatically and **persistently** as soon as it returns a permanent error (400/404/410, "trains on request data", unsupported region…). Delete an entry from the file to restore a model.
 
-### Ce qui est exclu des candidats
+Capacity ranking uses **output cost** as a proxy (ties broken by the largest contextWindow). An empty tier falls back to the next one; if everything fails, you get an explicit error.
 
-- les modèles **gratuits** (quota/timeout : sources de tours ratés) ;
-- les modèles **non-reasoning** ;
-- tout modèle dont le provider n'a pas de credentials valides ;
-- les modèles **`contributor`** (endpoints OpenCode qui entraînent sur tes
-  requêtes) ;
-- les générations retirées ou dépréciées : `gemini-2.5-*` (404 Google),
-  `mimo-v2.5` (410 OpenCode) ;
-- les modèles spécialisés non-code (`computer-use`, `robotics`,
-  `deep-research`) ;
-- tout modèle inscrit dans `~/.pi/agent/auto-route-denylist.json` —
-  banni automatiquement et **persistemment** dès qu'il renvoie une erreur
-  définitive (400/404/410, « trains on request data », région non
-  autorisée…). Supprime une entrée du fichier pour rétablir un modèle.
-
-Le classement par capacité utilise le **coût de sortie** comme proxy (à coût
-égal, le plus grand contextWindow gagne). Si un palier est vide, repli
-automatique sur le suivant ; si tout échoue, message explicite.
-
-## Installation
+## Install
 
 ```bash
-# à la session :
-pi -e /chemin/vers/auto-route.ts
+# for the session:
+pi -e /path/to/auto-route.ts
 
-# ou permanent (chargé automatiquement au démarrage de pi) :
-cp /chemin/vers/auto-route.ts ~/.pi/agent/extensions/auto-route.ts
+# or permanent (loaded at every pi start):
+cp /path/to/auto-route.ts ~/.pi/agent/extensions/auto-route.ts
 ```
 
-Puis `/model` → **auto → auto** (affiché « Auto (routage + thinking auto) »).
-La sélection part en thinking **`low`** par défaut — c'est un plafond :
-monte-le avec `shift+tab` quand tu veux laisser le routeur plus de réflexion.
+Then `/model` → **auto → auto** (shown as "Auto (routing + thinking + failover)"). Selecting it starts at thinking **`low`** — that level is a ceiling: raise it with `shift+tab` when you want the router to think harder.
 
-## Personnaliser
+## Customize
 
-Tout se règle en tête de fichier :
+Everything is set at the top of the file:
 
-- `difficultyScore()` : l'heuristique (signaux + seuils de longueur) —
-  chaque signal est un bout de regex commenté ; recalibre et relance
-  `node --test *.test.ts` après modification (`heuristics.test.ts` pour
-  le score, `failover.test.ts` pour le 429 et le thinking par défaut) ;
-- `tierAndThinking()` : la correspondance score → palier + thinking ;
-- le filtre de `candidateModels()` si tu veux réintégrer les modèles
-  gratuits ou non-reasoning.
+- `difficultyScore()`: the heuristic (signals plus length thresholds) — each signal is one commented regex; recalibrate and run `node --test *.test.ts` after any change (`heuristics.test.ts` for the score, `failover.test.ts` for the 429 handling and the default thinking);
+- `tierAndThinking()`: the score → tier + thinking mapping;
+- the filter in `candidateModels()` if you want free or non-reasoning models back.
 
-Pour forcer ponctuellement un modèle précis : bascule sur un vrai modèle via
-`/model`, puis reviens sur `auto` au tour suivant.
+To force one specific model for a single turn: switch to a real model with `/model`, then back to `auto` on the next turn.
 
-## Portabilité
+## Portability
 
-| Harness | État | Équivalent |
-|---|---|---|
-| **pi** | ✅ supporté (cette extension) | — |
-| Claude Code | ❌ non portable | idées proches : `jev-router` (gargpratyush), skills « model-router » — mécaniques internes Claude Code |
-| Codex | ❌ non portable | `jev-codex-router` (0xNatoshi) : modèle + thinking par tour |
-| Hermes | ❌ non portable | `hermes-jev-skills` (kerpopule) |
+- **pi**: supported (this extension).
+- **Claude Code**: not portable; close ideas: `jev-router` (gargpratyush), "model-router" skills (Claude Code internals).
+- **Codex**: not portable; `jev-codex-router` (0xNatoshi): model + thinking per turn.
+- **Hermes**: not portable; `hermes-jev-skills` (kerpopule).
 
-L'idée (planifier fort, exécuter léger, une bascule par tour, compaction
-dégénérée sur un modèle léger) est portable partout ; l'implémentation ici
-est liée à pi. Si tu veux un port pour un autre harness, ouvre une issue.
+The idea (plan strong, execute cheap, one switch per turn, degenerate compaction on a light model) ports everywhere; this implementation is tied to pi. Want a port for another harness? Open an issue.
 
-## Concepts clés
+## Key concepts
 
-- **Prompt cache** : le routage bascule *une fois* par tour, après la
-  planification — chaque bascule inter-provider invalide le cache, donc
-  l'arbitrage favorise les tours à plusieurs appels d'outils.
-- **État de route** : stocké sur la branche de session par pi ; il suit
-  l'arbre de session et survit à la compaction.
-- **Proxy de capacité** : le coût de sortie sert de classeur faute de
-  benchmark par tâche. Des données de benchmark maison (taux de détection du
-  reviewer, par exemple) sont une extension naturelle.
+- **Prompt cache**: the router switches *once* per turn, after planning — every cross-provider switch invalidates the cache, so the trade-off favors turns with several tool calls.
+- **Route state**: stored on the session branch by pi; it follows the session tree and survives compaction.
+- **Capacity proxy**: output cost ranks models in the absence of per-task benchmarks. Home-grown benchmark data (reviewer catch rate, say) is a natural extension.
 
-## Licence
+## License
 
-MIT — voir [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

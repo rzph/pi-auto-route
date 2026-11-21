@@ -1,11 +1,10 @@
 /**
- * Tests du failover 429 « quota fournisseur » et du thinking par défaut de `auto`.
+ * Tests for the provider-quota 429 failover and the default thinking of `auto`.
  *
- * Lancer avec :  node --test failover.test.ts
+ * Run with:  node --test failover.test.ts
  *
- * HOME est redirigé vers un répertoire temporaire AVANT le chargement du module :
- * la denylist persistante (~/.pi/agent/auto-route-denylist.json) est isolée des
- * vraies données pendant les tests.
+ * HOME is redirected to a temp directory BEFORE the module loads: the persistent
+ * denylist (~/.pi/agent/auto-route-denylist.json) stays isolated from real data.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -46,8 +45,8 @@ const QUOTA_ERROR: any = {
 		'opencode-go API error (429): {"type":"error","error":{"type":"GoUsageLimitError","message":"Go usage limit exceeded"},"metadata":{"limitName":"5 hour"}}',
 };
 
-/** Sous-chaînes qui rendent une erreur NON-retryable aux yeux de pi : le texte
- * réécrit ne doit en contenir aucune, sinon pi refuse toujours de retryer. */
+/** Substrings that make an error NON-retryable for pi: the rewritten text must
+ * contain none of them, otherwise pi still refuses to retry. */
 const PI_NON_RETRYABLE_MARKERS = [
 	"billing",
 	"quota exceeded",
@@ -57,21 +56,21 @@ const PI_NON_RETRYABLE_MARKERS = [
 	"1308",
 ];
 
-test("toFailoverRetryMessage réécrit un 429 de quota en erreur retryable", () => {
+test("toFailoverRetryMessage rewrites a quota 429 into a retryable error", () => {
 	const out = toFailoverRetryMessage(QUOTA_ERROR);
-	assert.ok(out, "le 429 de quota doit être réécrit");
-	assert.match(out.errorMessage, /429/, "le texte réécrit doit contenir le motif retryable « 429 »");
+	assert.ok(out, "the quota 429 must be rewritten");
+	assert.match(out.errorMessage, /429/, "the rewritten text must carry pi's retryable \"429\" pattern");
 	for (const marker of PI_NON_RETRYABLE_MARKERS) {
 		assert.ok(
 			!out.errorMessage.includes(marker),
-			`le texte réécrit ne doit pas contenir "${marker}"`,
+			`the rewritten text must not contain "${marker}"`,
 		);
 	}
-	assert.equal(out.provider, "opencode-go", "le modèle physique fautif reste identifié");
+	assert.equal(out.provider, "opencode-go", "the failing physical model stays identified");
 	assert.equal(out.model, "glm-5.3");
 });
 
-test("un 429 Google (quota/billing) est aussi réécrit", () => {
+test("a Google quota/billing 429 is rewritten too", () => {
 	const google: any = {
 		...QUOTA_ERROR,
 		provider: "google",
@@ -80,18 +79,18 @@ test("un 429 Google (quota/billing) est aussi réécrit", () => {
 			'{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details.","status":"RESOURCE_EXHAUSTED"}}',
 	};
 	const out = toFailoverRetryMessage(google);
-	assert.ok(out, "le 429 Google doit être réécrit");
+	assert.ok(out, "the Google 429 must be rewritten");
 	assert.match(out.errorMessage, /429/);
 	assert.ok(!/billing|quota exceeded/i.test(out.errorMessage));
 });
 
-test("toFailoverRetryMessage ignore ce qui n'a pas besoin de réécriture", () => {
-	// Abort utilisateur : ne jamais relancer automatiquement.
+test("toFailoverRetryMessage skips what does not need a rewrite", () => {
+	// User abort: never restart automatically.
 	assert.equal(
 		toFailoverRetryMessage({ ...QUOTA_ERROR, errorMessage: "This operation was aborted" }),
 		undefined,
 	);
-	// Débordement de contexte : géré par la compaction, pas par un retry.
+	// Context overflow: compaction handles it, not a retry.
 	assert.equal(
 		toFailoverRetryMessage({
 			...QUOTA_ERROR,
@@ -99,7 +98,7 @@ test("toFailoverRetryMessage ignore ce qui n'a pas besoin de réécriture", () =
 		}),
 		undefined,
 	);
-	// 429 déjà retryable (rate limit transit) : pi gère déjà, on ne touche pas au texte.
+	// Already-retryable 429 (transient rate limit): pi handles it, text untouched.
 	assert.equal(
 		toFailoverRetryMessage({
 			...QUOTA_ERROR,
@@ -107,25 +106,25 @@ test("toFailoverRetryMessage ignore ce qui n'a pas besoin de réécriture", () =
 		}),
 		undefined,
 	);
-	// Message sans erreur.
+	// Message without an error.
 	assert.equal(
 		toFailoverRetryMessage({ ...QUOTA_ERROR, stopReason: "stop", errorMessage: undefined }),
 		undefined,
 	);
 });
 
-test("message_end réécrit sous auto, pas hors auto, et ne bannit pas un quota", async () => {
+test("message_end rewrites under auto, not outside auto, and never bans a quota", async () => {
 	const { handlers } = loadRouter();
 	const autoCtx = { model: { provider: "auto", id: "auto" } };
 
 	const res = await handlers.message_end[0]({ message: QUOTA_ERROR }, autoCtx);
-	assert.ok(res?.message, "sous auto, le 429 est réécrit pour déclencher le retry de pi");
-	assert.match(res.message.errorMessage, /429 quota fournisseur/);
+	assert.ok(res?.message, "under auto, the 429 is rewritten to trigger pi's retry");
+	assert.match(res.message.errorMessage, /429 provider quota/);
 
-	// Un quota n'est pas une erreur définitive : la denylist reste vide.
-	assert.ok(!existsSync(DENYLIST), "un 429 ne doit pas bannir le modèle");
+	// A quota is not a permanent failure: the denylist stays empty.
+	assert.ok(!existsSync(DENYLIST), "a 429 must not ban the model");
 
-	// Hors auto (modèle physique sélectionné) : aucune réécriture, pi garde son comportement.
+	// Outside auto (physical model selected): no rewrite, pi keeps its behavior.
 	const res2 = await handlers.message_end[0](
 		{ message: QUOTA_ERROR },
 		{ model: { provider: "google", id: "gemini-4-argon" } },
@@ -133,7 +132,7 @@ test("message_end réécrit sous auto, pas hors auto, et ne bannit pas un quota"
 	assert.equal(res2, undefined);
 });
 
-test("message_end bannit toujours les erreurs définitives (404/410)", async () => {
+test("message_end still bans permanent failures (404/410)", async () => {
 	const { handlers } = loadRouter();
 	const dead: any = {
 		...QUOTA_ERROR,
@@ -143,23 +142,23 @@ test("message_end bannit toujours les erreurs définitives (404/410)", async () 
 		{ message: dead },
 		{ model: { provider: "auto", id: "auto" } },
 	);
-	assert.equal(res, undefined, "une erreur définitive n'est pas réécrite en retry");
-	assert.ok(existsSync(DENYLIST), "le modèle mort doit être banni");
+	assert.equal(res, undefined, "a permanent failure is never rewritten into a retry");
+	assert.ok(existsSync(DENYLIST), "the dead model must be banned");
 	const denylist = JSON.parse(readFileSync(DENYLIST, "utf8"));
 	assert.ok(denylist.includes("opencode-go/glm-5.3"));
 });
 
-test("sélectionner auto met le thinking à low par défaut", async () => {
+test("selecting auto sets thinking to low by default", async () => {
 	const { handlers, setThinkingCalls } = loadRouter();
 
 	await handlers.model_select[0]({ model: { provider: "auto", id: "auto" } }, {});
-	assert.deepEqual(setThinkingCalls, ["low"], "la sélection auto part en low");
+	assert.deepEqual(setThinkingCalls, ["low"], "selecting auto starts at low");
 
 	await handlers.model_select[0]({ model: { provider: "google", id: "gemini-4-argon" } }, {});
-	assert.deepEqual(setThinkingCalls, ["low"], "hors auto, aucun forçage de thinking");
+	assert.deepEqual(setThinkingCalls, ["low"], "outside auto, no thinking override");
 });
 
-test("retry après 429 quota : évite tout le fournisseur et bascule", async () => {
+test("retry after a quota 429: the whole provider is avoided, the router switches", async () => {
 	const { vm, handlers } = loadRouter();
 	const models: any[] = [
 		{ provider: "opencode-go", id: "kimi-k3", name: "Kimi K3", reasoning: true, cost: { input: 2, output: 15 }, contextWindow: 200000 },
@@ -174,7 +173,7 @@ test("retry après 429 quota : évite tout le fournisseur et bascule", async () 
 		ui: { setStatus: () => {} },
 	};
 
-	// pi transmet au retry le message réécrit par message_end.
+	// pi hands pi's retry the message rewritten by message_end.
 	const rewritten = (
 		await handlers.message_end[0]({ message: QUOTA_ERROR }, { model: { provider: "auto", id: "auto" } })
 	).message;
@@ -189,11 +188,11 @@ test("retry après 429 quota : évite tout le fournisseur et bascule", async () 
 		},
 		ctx,
 	);
-	assert.notEqual(r.model.provider, "opencode-go", "le failover doit changer de fournisseur");
-	assert.ok(r.state.avoid.includes("opencode-go"), "tout le fournisseur est évité pour ce tour");
+	assert.notEqual(r.model.provider, "opencode-go", "the failover must change provider");
+	assert.ok(r.state.avoid.includes("opencode-go"), "the whole provider is avoided for this turn");
 });
 
-test("retry sur erreur transitoire : évite le modèle, pas tout le fournisseur", async () => {
+test("retry on a transient error: the model is avoided, not the whole provider", async () => {
 	const { vm } = loadRouter();
 	const models: any[] = [
 		{ provider: "opencode-go", id: "kimi-k3", name: "Kimi K3", reasoning: true, cost: { input: 2, output: 15 }, contextWindow: 200000 },
@@ -221,7 +220,7 @@ test("retry sur erreur transitoire : évite le modèle, pas tout le fournisseur"
 		},
 		ctx,
 	);
-	assert.ok(r.state.avoid.includes("opencode-go/glm-5.3"), "le modèle fautif est évité");
-	assert.ok(!r.state.avoid.includes("opencode-go"), "le fournisseur entier n'est pas évité");
+	assert.ok(r.state.avoid.includes("opencode-go/glm-5.3"), "the failing model is avoided");
+	assert.ok(!r.state.avoid.includes("opencode-go"), "the whole provider is not avoided");
 	assert.notEqual(r.model.id, "glm-5.3");
 });
