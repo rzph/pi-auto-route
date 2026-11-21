@@ -53,6 +53,14 @@ On each turn, in order:
 4. **Compaction and invisible summaries** always go to the lightest model — the token leak nobody sees.
 5. **Failover instead of a crash.** A timeout or overload (429/5xx) moves to the next model of the ladder. A **429 provider-quota** error — which pi treats as non-retryable, so the turn would die — is rewritten into a retryable one, and the router then avoids the **whole provider**: the turn continues on another provider instead. Permanent errors (400/404/410, and messages like "trains on request data" or "unsupported region") ban the model persistently. See `failover.test.ts`.
 
+### Free classifiers and borrowed keys
+
+A classifier can be free (cost 0) while living under a provider you never configured. OpenCode's `jev-1.13-free` sits under `opencode`, which most users only meet as the pay-as-you-go Zen endpoint; enabling that provider just to reach the classifier would flood `/model` with chat models that fail with HTTP 402.
+
+So when no classifier of that provider is available, the router borrows a key. It scans every provider in your registry that holds one (`getAll` + `getApiKeyForProvider`), prefers an OpenCode key when there is one, and passes it per request — only for the classification call, only to the free classifier. The classifier costs nothing, so no quota is consumed and nothing is enabled globally.
+
+Keys are tried in order, and a key the classifier rejects moves on to the next candidate instead of ending the turn. There is one limit: OpenCode validates the credential itself, so a Google key is answered with 401 and never unlocks Jev. With no usable key left, the turn falls back to the local heuristic.
+
 ### Excluded from the candidates
 
 - **free** models (tight quotas, constant timeouts);
