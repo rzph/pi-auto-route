@@ -1,22 +1,22 @@
 /**
  * auto-route — modèle virtuel `auto/auto` : routage automatique complet.
  *
- * Sélectionné via /model → « auto ». Alors :
- * - les candidats = TOUS les modèles chat raisonnables de TON catalogue
- *   dont le provider a des credentials valides. Sont exclus :
- *   les modèles gratuits (noms contenant « free », coût nul) et les
- *   modèles non-reasoning — comme demandé : pas de timeouts, pas de
- *   perte de performance.
- * - le routeur classe le catalogue par capacité (coût de sortie comme
- *   proxy) et choisit le palier + le niveau de thinking selon la
- *   difficulté estimée de la tâche (heuristique locale, 0 classe
- *   externe).
- * - un tour = au plus UNE bascule de modèle (après le premier
- *   edit/write réussi) pour préserver le cache de prompt.
- * - la compaction/résumés partent sur le modèle le plus léger.
+ * Sélectionné via /model → « auto » :
+ * - candidats = TOUS les modèles chat reasoning payants dont le provider
+ *   a des credentials valides (gratuits exclus : quotas/timeout) ;
+ * - paliers de capacité bâtis au runtime (coût de sortie comme proxy) ;
+ * - difficulté estimée localement → palier + niveau de thinking ;
+ * - le thinking sélectionné dans /model agit comme PLAFOND : tu peux
+ *   toujours baisser, le routeur ne dépasse jamais ton choix ;
+ * - FAILOVER : en cas d'échec (timeout, quota, erreur réseau), la retry
+ *   part sur un autre modèle du même palier, puis sur un palier
+ *   inférieur si ça récidive — l'échec et son modèle sont exclus ;
+ * - le modèle physique courant est affiché dans la barre de statut ;
+ * - une bascule de modèle max par tour (cache de prompt préservé) ;
+ * - compaction/résumés → le plus léger.
  *
- * Usage : pi -e ~/.pi/agent/extensions/auto-route.ts
- *         puis /model → auto
+ * Pi-spec (pi.registerVirtualModel, ModelRegistry, ctx.ui.setStatus).
+ * Usage : pi -e ~/.pi/agent/extensions/auto-route.ts puis /model → auto
  */
 
 import type { Message } from "@earendil-works/pi-ai";
@@ -30,19 +30,22 @@ import type {
 
 const EDIT_TOOLS = new Set(["edit", "write"]);
 
+type Thinking = "off" | "low" | "medium" | "high" | "xhigh";
+const THINKING_ORDER: Thinking[] = ["off", "low", "medium", "high", "xhigh"];
+
 interface RouteState {
 	phase: "start" | "impl";
 	modelId: string;
 	providerId: string;
-	thinking: ModelThinkingLevel;
+	thinking: Thinking;
+	/** provider/id des modèles exclus par échec dans ce tour. */
+	avoid: string[];
 }
 
 type Req = ModelRouteRequest<RouteState>;
-type ModelThinkingLevel = "off" | "low" | "medium" | "high" | "xhigh";
 
 // ---------- Catalogue dynamique ----------
 
-/** Filtre les modèles candidats : chat, reasoning, non gratuits, auth OK. */
 function candidateModels(ctx: ExtensionContext): Model<never>[] {
 	return (ctx.modelRegistry.getAvailable() as Model<never>[]).filter((m) => {
 		const free =
@@ -53,64 +56,85 @@ function candidateModels(ctx: ExtensionContext): Model<never>[] {
 	});
 }
 
-/**
- * Classe les candidats par capacité, découpe en 4 paliers et renvoie un
- * accès palier → modèle. Coût de sortie ≈ proxy de capacité ; à coût
- * proche, le plus grand contextWindow gagne.
- */
-function buildTiers(ctx: ExtensionContext) {
-	const sorted = [...candidateModels(ctx)].sort((a, b) => {
+function buildTiers(ctx: ExtensionContext, avoid: string[] = []) {
+	const pool = candidateModels(ctx).filter(
+		(m) => !avoid.includes(`${m.provider}/${m.id}`),
+	);
+	if (pool.length === 0) {
+		// Tout est exclu : on retente sans exclusions plutôt que de mourir.
+		return buildTiers(ctx, []);
+	}
+	const sorted = [...pool].sort((a, b) => {
 		const ca = a.cost?.output ?? 0;
 		const cb = b.cost?.output ?? 0;
 		if (Math.abs(ca - cb) < 0.01) return (b.contextWindow ?? 0) - (a.contextWindow ?? 0);
 		return cb - ca;
 	});
-	if (sorted.length === 0) throw new Error("auto-route : aucun modèle candidat (auth ?)");
-	const at = (frac: number): Model<never> => sorted[Math.min(sorted.length - 1, Math.floor(frac * sorted.length))];
+	const at = (frac: number): Model<never> =>
+		sorted[Math.min(sorted.length - 1, Math.floor(frac * sorted.length))];
 	return {
-		frontier: at(0),      // le plus cher = le plus capable
+		frontier: at(0),
 		strong: at(0.33),
 		standard: at(0.66),
-		eco: sorted[sorted.length - 1], // le moins cher qui passe le filtre
+		eco: sorted[sorted.length - 1],
 		background: sorted[sorted.length - 1],
 	} as const;
 }
 
 function toRoute(
 	request: Req,
+	ctx: ExtensionContext,
 	m: Model<never>,
-	thinking: ModelThinkingLevel,
+	thinking: Thinking,
 	state?: RouteState,
 ): ModelRoute<RouteState> {
+	ctx.ui.setStatus(
+		"auto-route",
+		`auto → ${m.provider}/${m.id} · thinking ${thinking}`,
+	);
 	return {
 		model: m,
 		thinkingLevel: thinking,
-		state: state ?? { phase: "start", modelId: m.id, providerId: m.provider, thinking },
+		state:
+			state ?? {
+				phase: "start",
+				modelId: m.id,
+				providerId: m.provider,
+				thinking,
+				avoid: [],
+			},
 	};
 }
 
-// ---------- Heuristique de difficulté (score continu 0..1) ----------
+// ---------- Heuristique de difficulté ----------
 
 function difficultyScore(text: string): number {
 	const t = text.trim();
-	let score = 0.15; // une demande simple a une base non nulle
 	if (t.length < 120 && !/[;{}`]|def |const |class /.test(t)) return 0.1;
+	let score = 0.15;
 	const kw = t.match(
 		/\b(architecture|conception|refactor|d[ée]bogu|debug|optimis|s[ée]curit|timing|algorithme|compar|pourquoi|analyse|syst[èe]me|protocole)\b/gi,
 	);
-	score += Math.min(0.4, (kw?.length ?? 0) * 0.1); // jusqu'à 4 mots-clés
+	score += Math.min(0.4, (kw?.length ?? 0) * 0.1);
 	if (t.length > 800) score += 0.15;
 	if (t.length > 2000) score += 0.15;
-	if (/```/.test(t)) score += 0.15; // du code dans la demande
+	if (/```/.test(t)) score += 0.15;
 	if (/\b(pas le m[êe]me|r[ée]gression|cass[ée]|fuit|bloqu[ée]|corriger)\b/i.test(t)) score += 0.1;
 	return Math.min(1, score);
 }
 
-function tierAndThinking(score: number): { tier: string; thinking: ModelThinkingLevel } {
-	if (score >= 0.7) return { tier: "frontier", thinking: "xhigh" };
-	if (score >= 0.45) return { tier: "strong", thinking: "high" };
-	if (score >= 0.25) return { tier: "standard", thinking: "medium" };
-	return { tier: "eco", thinking: "low" };
+function tierFor(score: number): "frontier" | "strong" | "standard" | "eco" {
+	if (score >= 0.7) return "frontier";
+	if (score >= 0.45) return "strong";
+	if (score >= 0.25) return "standard";
+	return "eco";
+}
+
+/** thinking automatique, plafonné par le choix explicite de l'utilisateur. */
+function capThinking(auto: Thinking, userSelected: Thinking): Thinking {
+	const autoIdx = THINKING_ORDER.indexOf(auto);
+	const userIdx = THINKING_ORDER.indexOf(userSelected);
+	return THINKING_ORDER[Math.min(autoIdx, userIdx)];
 }
 
 // ---------- Utilitaires ----------
@@ -135,48 +159,101 @@ function editedThisTurn(messages: readonly Message[]): boolean {
 		);
 }
 
+function key(m: Model<never>): string {
+	return `${m.provider}/${m.id}`;
+}
+
+// Adaptateur : garde les appels courts au fil des routes.
+function R(
+	request: Req,
+	ctx: ExtensionContext,
+	m: Model<never>,
+	thinking: Thinking,
+	state?: RouteState,
+): ModelRoute<RouteState> {
+	return toRoute(request, ctx, m, thinking, state);
+}
+
 export default function (pi: ExtensionAPI) {
 	pi.registerVirtualModel<RouteState>({
 		provider: "auto",
 		id: "auto",
-		name: "Auto (routage + thinking auto)",
+		name: "Auto (routage + thinking + failover)",
 		thinkingLevels: ["off", "low", "medium", "high", "xhigh"],
 		contextWindow: 200_000,
 		maxTokens: 64_000,
 		async route(request, ctx) {
 			// Appels hors boucle (compaction, résumés) → le plus léger.
 			if (request.reason === "direct") {
-				return toRoute(request, buildTiers(ctx).background, "low");
+				return R(request, ctx, buildTiers(ctx).background, "low");
+			}
+
+			// ---- RETRY : failover ----
+			if (request.reason === "retry" && request.failed) {
+				const failedKey = `${request.failed.model.provider}/${request.failed.model.id}`;
+				const state: RouteState = request.state ?? {
+					phase: "start",
+					modelId: request.failed.model.id,
+					providerId: request.failed.model.provider,
+					thinking: (request.failed.thinkingLevel ?? "medium") as Thinking,
+					avoid: [],
+				};
+				const avoid = [...new Set([...state.avoid, failedKey])];
+				// Stratégie : d'abord un autre modèle du même palier ; si le
+				// palier devient vide, buildTiers retombera sur un autre choix
+				// (pool filtré). Si on accumule 3+ échecs, on repart d'un
+				// palier plus léger pour garantir une réponse.
+				const tiers = buildTiers(ctx, avoid);
+				const candidates: Array<[keyof typeof tiers, Thinking]> =
+					avoid.length >= 3
+						? [["standard", state.thinking], ["eco", state.thinking]]
+						: [["strong", state.thinking], ["standard", state.thinking], ["eco", state.thinking]];
+				for (const [tier, th] of candidates) {
+					const m = tiers[tier];
+					if (m && !avoid.includes(key(m))) {
+						return R(request, ctx, m, th, { ...state, avoid });
+					}
+				}
+				// Dernier recours : le meilleur candidat restant, quel qu'il soit.
+				const any = buildTiers(ctx, avoid).frontier;
+				return R(request, ctx, any, state.thinking, { ...state, avoid });
 			}
 
 			const state = request.state;
 
-			// Déjà en phase implémentation → reste sur le modèle éco, thinking conservé.
+			// Déjà en phase implémentation → reste sur le même modèle.
 			if (state?.phase === "impl") {
 				const m = ctx.modelRegistry.find(state.providerId, state.modelId);
-				if (m) return { model: m, thinkingLevel: state.thinking, state };
+				if (m) {
+					const th = capThinking(state.thinking, request.thinkingLevel as Thinking);
+					return R(request, ctx, m, th, state);
+				}
 			}
 
 			// Premier edit/write réussi du tour → bascule implémentation.
 			if (editedThisTurn(request.messages)) {
-				const tiers = buildTiers(ctx);
-				return toRoute(request, tiers.eco, "medium", {
+				const eco = buildTiers(ctx).eco;
+				return R(request, ctx, eco, capThinking("medium", request.thinkingLevel as Thinking), {
 					phase: "impl",
-					modelId: tiers.eco.id,
-					providerId: tiers.eco.provider,
+					modelId: eco.id,
+					providerId: eco.provider,
 					thinking: "medium",
+					avoid: state?.avoid ?? [],
 				});
 			}
 
-			// Nouveau tour (ou session neuve) → difficulté → palier + thinking.
+			// Nouveau tour → difficulté → palier + thinking (plafonné).
 			const score = difficultyScore(lastUserText(request.messages));
-			const { tier, thinking } = tierAndThinking(score);
-			const m = buildTiers(ctx)[tier as keyof ReturnType<typeof buildTiers>];
-			return toRoute(request, m, thinking, {
+			const tier = tierFor(score);
+			const autoTh: Thinking = score >= 0.7 ? "xhigh" : score >= 0.45 ? "high" : score >= 0.25 ? "medium" : "low";
+			const th = capThinking(autoTh, request.thinkingLevel as Thinking);
+			const m = buildTiers(ctx, state?.avoid ?? [])[tier];
+			return R(request, ctx, m, th, {
 				phase: "start",
 				modelId: m.id,
 				providerId: m.provider,
-				thinking,
+				thinking: th,
+				avoid: [],
 			});
 		},
 	});
