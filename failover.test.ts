@@ -6,9 +6,9 @@
  * HOME is redirected to a temp directory BEFORE the module loads: the persistent
  * denylist (~/.pi/agent/auto-route-denylist.json) stays isolated from real data.
  */
-import { test } from "node:test";
+import { beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -17,10 +17,18 @@ const AGENT_DIR = mkdtempSync(join(tmpdir(), "auto-route-agent-"));
 process.env.PI_CODING_AGENT_DIR = AGENT_DIR;
 process.env.HOME = mkdtempSync(join(tmpdir(), "auto-route-test-"));
 
-const { default: autoRoute, toFailoverRetryMessage } = await import("./auto-route.ts");
-const { isPermanentFailure, PROVIDER_LIMIT_RE } = await import("./auto-route.ts");
+const {
+	default: autoRoute,
+	classifyFailure,
+	resetDenylist,
+	toFailoverRetryMessage,
+} = await import("./auto-route.ts");
 
 const DENYLIST = join(AGENT_DIR, "auto-route-denylist.json");
+
+beforeEach(() => {
+	resetDenylist();
+});
 
 function loadRouter() {
 	let vm: any;
@@ -37,6 +45,16 @@ function loadRouter() {
 	};
 	autoRoute(pi);
 	return { vm, handlers, setThinkingCalls };
+}
+
+function makeCtx(models: any[]): any {
+	return {
+		modelRegistry: {
+			getAvailable: () => models,
+			find: (p: string, id: string) => models.find((m) => m.provider === p && m.id === id),
+		},
+		ui: { setStatus: () => {} },
+	};
 }
 
 const QUOTA_ERROR: any = {
@@ -74,18 +92,45 @@ test("toFailoverRetryMessage rewrites a quota 429 into a retryable error", () =>
 	assert.equal(out.model, "glm-5.3");
 });
 
-test("a Google quota/billing 429 is rewritten too", () => {
-	const google: any = {
+test("a Google quota/billing 429 is rewritten, while a transient Google 429 RESOURCE_EXHAUSTED is not", () => {
+	const googleBilling: any = {
 		...QUOTA_ERROR,
 		provider: "google",
 		model: "gemini-4-argon",
 		errorMessage:
 			'{"error":{"code":429,"message":"You exceeded your current quota, please check your plan and billing details.","status":"RESOURCE_EXHAUSTED"}}',
 	};
-	const out = toFailoverRetryMessage(google);
-	assert.ok(out, "the Google 429 must be rewritten");
+	const out = toFailoverRetryMessage(googleBilling);
+	assert.ok(out, "the Google billing/quota 429 must be rewritten");
 	assert.match(out.errorMessage, /429/);
 	assert.ok(!/billing|quota exceeded/i.test(out.errorMessage));
+
+	// Transient rate-limit 429 RESOURCE_EXHAUSTED without billing/quota-exceeded:
+	// pi already treats it as retryable, so it must not be rewritten.
+	const googleTransient: any = {
+		...QUOTA_ERROR,
+		provider: "google",
+		model: "gemini-4-argon",
+		errorMessage:
+			'{"error":{"code":429,"message":"Resource has been exhausted (e.g. check rate limit).","status":"RESOURCE_EXHAUSTED"}}',
+	};
+	assert.equal(classifyFailure(googleTransient.errorMessage), "provider-limit");
+	assert.equal(toFailoverRetryMessage(googleTransient), undefined);
+});
+
+test("a Zhipu 1308 usage-limit 429 is classified as provider-limit and rewritten", () => {
+	const zhipu: any = {
+		...QUOTA_ERROR,
+		provider: "zhipu",
+		model: "glm-5",
+		errorMessage:
+			'zhipu API error (429): {"error":{"code":"1308","message":"Usage limit reached for your plan"}}',
+	};
+	assert.equal(classifyFailure(zhipu.errorMessage), "provider-limit");
+	const out = toFailoverRetryMessage(zhipu);
+	assert.ok(out, "Zhipu 1308 must be rewritten because pi treats code 1308 as non-retryable");
+	assert.match(out.errorMessage, /429 provider quota/);
+	assert.ok(!out.errorMessage.includes("1308"));
 });
 
 test("a 403 model-access error is rewritten into a retryable 429 (found live: opencode Zen models disabled on a Go key)", () => {
@@ -103,12 +148,10 @@ test("a 403 model-access error is rewritten into a retryable 429 (found live: op
 		!/permission_error/i.test(out.errorMessage),
 		"the rewritten text must not carry the provider's non-retryable wording",
 	);
-	// A disabled model is a per-model problem: the whole provider must NOT be
-	// avoided (other models on the same account, free classifiers included,
-	// keep working).
-	assert.ok(!PROVIDER_LIMIT_RE.test(disabled.errorMessage));
-	// And the model itself is permanently banned.
-	assert.ok(isPermanentFailure(disabled.errorMessage));
+	// A disabled model is a per-model problem: classified as model-access (and
+	// still recognized as model-access after the rewrite).
+	assert.equal(classifyFailure(disabled.errorMessage), "model-access");
+	assert.equal(classifyFailure(out.errorMessage), "model-access");
 });
 
 test("an insufficient-balance 402 (pay-as-you-go provider not covered by the key) is rewritten", () => {
@@ -126,10 +169,27 @@ test("an insufficient-balance 402 (pay-as-you-go provider not covered by the key
 		!/insufficient balance|billing/i.test(out.errorMessage),
 		"the rewritten text must not carry the provider's non-retryable wording",
 	);
-	// A balance problem is account-wide: the whole provider is the right scope.
-	assert.ok(PROVIDER_LIMIT_RE.test(out.errorMessage));
-	// Not permanent though: the account can be topped up later.
-	assert.ok(!isPermanentFailure(balance.errorMessage));
+	// A balance problem is account-wide: the whole provider is the right scope,
+	// and it is not a permanent model failure.
+	assert.equal(classifyFailure(balance.errorMessage), "provider-limit");
+	assert.equal(classifyFailure(out.errorMessage), "provider-limit");
+});
+
+test("request-specific 400 errors (unsupported image format, file not found) are transient and never ban the model", async () => {
+	const { handlers } = loadRouter();
+	for (const text of [
+		"400 Bad Request: Unsupported image format image/tiff",
+		"400 Bad Request: file not found in upload batch",
+	]) {
+		assert.equal(classifyFailure(text), "transient", `"${text}" must be transient`);
+		const msg: any = { ...QUOTA_ERROR, errorMessage: text };
+		assert.equal(toFailoverRetryMessage(msg), undefined);
+		await handlers.message_end[0](
+			{ message: msg },
+			{ model: { provider: "auto", id: "auto" } },
+		);
+		assert.ok(!existsSync(DENYLIST), `"${text}" must not ban the model`);
+	}
 });
 
 test("retry after a model-access 429 avoids the model, not the whole provider", async () => {
@@ -139,13 +199,7 @@ test("retry after a model-access 429 avoids the model, not the whole provider", 
 		{ provider: "opencode", id: "glm-mini", name: "GLM Mini", reasoning: true, cost: { input: 1, output: 4 }, contextWindow: 200000 },
 		{ provider: "google", id: "gemini-4-argon", name: "Gemini 4", reasoning: true, cost: { input: 2, output: 10 }, contextWindow: 200000 },
 	];
-	const ctx: any = {
-		modelRegistry: {
-			getAvailable: () => models,
-			find: (p: string, id: string) => models.find((m) => m.provider === p && m.id === id),
-		},
-		ui: { setStatus: () => {} },
-	};
+	const ctx = makeCtx(models);
 
 	// pi hands the retry the message rewritten by message_end.
 	const disabled: any = {
@@ -176,9 +230,6 @@ test("retry after a model-access 429 avoids the model, not the whole provider", 
 		!r.state?.avoid?.some((a: string) => a === "opencode"),
 		"the whole provider must NOT be avoided: other models of the account still work",
 	);
-	// The message_end call above legitimately banned the inaccessible model;
-	// remove the denylist so the later quota test starts from a clean slate.
-	rmSync(DENYLIST, { force: true });
 });
 
 test("toFailoverRetryMessage skips what does not need a rewrite", () => {
@@ -262,13 +313,7 @@ test("retry after a quota 429: the whole provider is avoided, the router switche
 		{ provider: "opencode-go", id: "glm-5.3", name: "GLM 5.3", reasoning: true, cost: { input: 1, output: 4.4 }, contextWindow: 200000 },
 		{ provider: "google", id: "gemini-4-argon", name: "Gemini 4", reasoning: true, cost: { input: 2, output: 10 }, contextWindow: 200000 },
 	];
-	const ctx: any = {
-		modelRegistry: {
-			getAvailable: () => models,
-			find: (p: string, id: string) => models.find((m) => m.provider === p && m.id === id),
-		},
-		ui: { setStatus: () => {} },
-	};
+	const ctx = makeCtx(models);
 
 	// pi hands pi's retry the message rewritten by message_end.
 	const rewritten = (
@@ -295,13 +340,7 @@ test("retry on a transient error: the model is avoided, not the whole provider",
 		{ provider: "opencode-go", id: "kimi-k3", name: "Kimi K3", reasoning: true, cost: { input: 2, output: 15 }, contextWindow: 200000 },
 		{ provider: "opencode-go", id: "glm-5.3", name: "GLM 5.3", reasoning: true, cost: { input: 1, output: 4.4 }, contextWindow: 200000 },
 	];
-	const ctx: any = {
-		modelRegistry: {
-			getAvailable: () => models,
-			find: (p: string, id: string) => models.find((m) => m.provider === p && m.id === id),
-		},
-		ui: { setStatus: () => {} },
-	};
+	const ctx = makeCtx(models);
 
 	const r = await vm.route(
 		{
@@ -340,13 +379,7 @@ test("a transient rate limit keeps its original text but still avoids the provid
 		{ provider: "anthropic", id: "claude-test", name: "Claude", reasoning: true, cost: { input: 2, output: 15 }, contextWindow: 200000 },
 		{ provider: "google", id: "gemini-4-argon", name: "Gemini 4", reasoning: true, cost: { input: 2, output: 10 }, contextWindow: 200000 },
 	];
-	const ctx: any = {
-		modelRegistry: {
-			getAvailable: () => models,
-			find: (p: string, id: string) => models.find((m) => m.provider === p && m.id === id),
-		},
-		ui: { setStatus: () => {} },
-	};
+	const ctx = makeCtx(models);
 
 	const r = await vm.route(
 		{
@@ -369,13 +402,7 @@ test("a model without pricing data is still a candidate", async () => {
 	const models: any[] = [
 		{ provider: "acme", id: "mystery", name: "Mystery", reasoning: true, contextWindow: 100000 },
 	];
-	const ctx: any = {
-		modelRegistry: {
-			getAvailable: () => models,
-			find: (p: string, id: string) => models.find((m) => m.provider === p && m.id === id),
-		},
-		ui: { setStatus: () => {} },
-	};
+	const ctx = makeCtx(models);
 
 	const r = await vm.route(
 		{
@@ -387,4 +414,197 @@ test("a model without pricing data is still a candidate", async () => {
 		ctx,
 	);
 	assert.equal(r.model.id, "mystery", "a pricing-less model must not be dropped from the catalog");
+});
+
+test("retry when avoid exhausts the catalog falls back to eco (not frontier) and handles missing failed", async () => {
+	const { vm } = loadRouter();
+	const models: any[] = [
+		{ provider: "acme", id: "expensive", name: "Expensive", reasoning: true, cost: { input: 5, output: 30 }, contextWindow: 200000 },
+		{ provider: "acme", id: "cheap", name: "Cheap", reasoning: true, cost: { input: 0.5, output: 2 }, contextWindow: 200000 },
+	];
+	const ctx = makeCtx(models);
+
+	// Provider-limit on the only provider: `avoid` now covers all models.
+	const r1 = await vm.route(
+		{
+			reason: "retry",
+			thinkingLevel: "xhigh",
+			failed: {
+				model: models[0],
+				thinkingLevel: "high",
+				message: { role: "assistant", stopReason: "error", errorMessage: "429 rate_limit_error" },
+			},
+			messages: [{ role: "user", content: "ok" }],
+			state: undefined,
+		},
+		ctx,
+	);
+	assert.equal(r1.model.id, "cheap", "when avoid covers all candidates, last-resort fallback must be eco");
+
+	// Router-level retry without `failed`: preserves state.avoid without calling classifyTier.
+	let classifyCalled = false;
+	ctx.modelRegistry.getAvailableOfType = async () => {
+		classifyCalled = true;
+		return [];
+	};
+	const r2 = await vm.route(
+		{
+			reason: "retry",
+			thinkingLevel: "xhigh",
+			failed: undefined,
+			messages: [{ role: "user", content: "ok" }],
+			state: { modelId: "expensive", providerId: "acme", thinking: "high", avoid: ["acme/expensive"], source: "local" },
+		},
+		ctx,
+	);
+	assert.equal(classifyCalled, false, "retry without failed must not re-run classification");
+	assert.equal(r2.model.id, "cheap");
+	assert.deepEqual(r2.state.avoid, ["acme/expensive"]);
+});
+
+test("continuation without edit (or with failed edit) keeps current model and returns state: undefined when thinking is unchanged", async () => {
+	const { vm } = loadRouter();
+	const models: any[] = [
+		{ provider: "acme", id: "strong-1", name: "Strong 1", reasoning: true, cost: { input: 5, output: 20 }, contextWindow: 200000 },
+		{ provider: "acme", id: "eco-1", name: "Eco 1", reasoning: true, cost: { input: 0.5, output: 2 }, contextWindow: 200000 },
+	];
+	const ctx = makeCtx(models);
+	const prevState = {
+		modelId: "strong-1",
+		providerId: "acme",
+		thinking: "high",
+		avoid: [],
+		source: "local",
+	};
+
+	// After a read tool result and a failed edit (isError: true): still on strong-1.
+	const r = await vm.route(
+		{
+			reason: "continuation",
+			thinkingLevel: "xhigh",
+			messages: [
+				{ role: "user", content: "refactor src/app.ts" },
+				{ role: "toolResult", toolName: "read", isError: false, content: [] },
+				{ role: "toolResult", toolName: "edit", isError: true, content: [] },
+			],
+			state: prevState,
+		},
+		ctx,
+	);
+	assert.equal(r.model.id, "strong-1", "failed edit must not switch to eco");
+	assert.equal(r.thinkingLevel, "high");
+	assert.equal(r.state, undefined, "unchanged state must be undefined so pi skips session persistence");
+});
+
+test("continuation after a successful edit/write switches to eco (capped at medium) and omits state on subsequent eco continuations", async () => {
+	const { vm } = loadRouter();
+	const models: any[] = [
+		{ provider: "acme", id: "strong-1", name: "Strong 1", reasoning: true, cost: { input: 5, output: 20 }, contextWindow: 200000 },
+		{ provider: "acme", id: "eco-1", name: "Eco 1", reasoning: true, cost: { input: 0.5, output: 2 }, contextWindow: 200000 },
+	];
+	const ctx = makeCtx(models);
+	const prevState = {
+		modelId: "strong-1",
+		providerId: "acme",
+		thinking: "high",
+		avoid: ["other/bad"],
+		source: "local",
+	};
+	const messages = [
+		{ role: "user", content: "refactor src/app.ts" },
+		{ role: "toolResult", toolName: "edit", isError: false, content: [] },
+	];
+
+	const r1 = await vm.route(
+		{
+			reason: "continuation",
+			thinkingLevel: "xhigh",
+			messages,
+			state: prevState,
+		},
+		ctx,
+	);
+	assert.equal(r1.model.id, "eco-1", "first successful edit switches to eco");
+	assert.equal(r1.thinkingLevel, "medium", "post-edit thinking is capped at medium");
+	assert.ok(r1.state, "the model switch must persist the new state");
+	assert.equal(r1.state.modelId, "eco-1");
+	assert.deepEqual(r1.state.avoid, ["other/bad"]);
+
+	// Next continuation in the same turn (already on eco-1 at medium): state is undefined.
+	const r2 = await vm.route(
+		{
+			reason: "continuation",
+			thinkingLevel: "xhigh",
+			messages: [
+				...messages,
+				{ role: "toolResult", toolName: "bash", isError: false, content: [] },
+			],
+			state: r1.state,
+		},
+		ctx,
+	);
+	assert.equal(r2.model.id, "eco-1");
+	assert.equal(r2.state, undefined, "already on eco at medium: no new state entry");
+});
+
+test("continuation safety fallback re-routes when the current model was banned meanwhile, preserving avoid", async () => {
+	const { vm, handlers } = loadRouter();
+	const models: any[] = [
+		{ provider: "acme", id: "dead-model", name: "Dead", reasoning: true, cost: { input: 5, output: 20 }, contextWindow: 200000 },
+		{ provider: "acme", id: "alive-model", name: "Alive", reasoning: true, cost: { input: 1, output: 4 }, contextWindow: 200000 },
+	];
+	const ctx = makeCtx(models);
+
+	// Ban acme/dead-model via message_end (404).
+	await handlers.message_end[0](
+		{
+			message: {
+				...QUOTA_ERROR,
+				provider: "acme",
+				model: "dead-model",
+				errorMessage: '{"error":{"code":404,"message":"model not found"}}',
+			},
+		},
+		{ model: { provider: "auto", id: "auto" } },
+	);
+
+	const r = await vm.route(
+		{
+			reason: "continuation",
+			thinkingLevel: "xhigh",
+			messages: [{ role: "user", content: "ok" }],
+			state: {
+				modelId: "dead-model",
+				providerId: "acme",
+				thinking: "low",
+				avoid: ["other/flaky"],
+				source: "local",
+			},
+		},
+		ctx,
+	);
+	assert.equal(r.model.id, "alive-model", "banned current model triggers safety re-route to an available model");
+	assert.deepEqual(r.state.avoid, ["other/flaky"], "turn-local avoid list is preserved across safety re-route");
+});
+
+test("direct reason routes to eco at low thinking without state", async () => {
+	const { vm } = loadRouter();
+	const models: any[] = [
+		{ provider: "acme", id: "strong-1", name: "Strong 1", reasoning: true, cost: { input: 5, output: 20 }, contextWindow: 200000 },
+		{ provider: "acme", id: "eco-1", name: "Eco 1", reasoning: true, cost: { input: 0.5, output: 2 }, contextWindow: 200000 },
+	];
+	const ctx = makeCtx(models);
+
+	const r = await vm.route(
+		{
+			reason: "direct",
+			thinkingLevel: "xhigh",
+			messages: [{ role: "user", content: "summarize" }],
+			state: undefined,
+		},
+		ctx,
+	);
+	assert.equal(r.model.id, "eco-1");
+	assert.equal(r.thinkingLevel, "low");
+	assert.equal(r.state, undefined);
 });

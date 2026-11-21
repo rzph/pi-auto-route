@@ -28,7 +28,15 @@
  * Usage: pi -e ~/.pi/agent/extensions/auto-route.ts then /model → auto
  */
 
-import type { AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
+import type {
+	Api,
+	AssistantMessage,
+	ClassifierApi,
+	ClassifierModel,
+	Message,
+	Model,
+	ModelThinkingLevel,
+} from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -36,7 +44,7 @@ import type {
 	ModelRouteRequest,
 } from "@earendil-works/pi-coding-agent";
 
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -44,6 +52,9 @@ const EDIT_TOOLS = new Set(["edit", "write"]);
 
 /** Output cost assumed for models without pricing data: mid-tier, neither free nor frontier. */
 const UNKNOWN_OUTPUT_COST = 1;
+
+/** Number of turn-local failures (`avoid` entries) after which the retry ladder drops the `strong` tier. */
+const DEGRADE_AFTER_FAILURES = 3;
 
 /**
  * ID/name patterns excluded up front:
@@ -68,9 +79,17 @@ function agentDir(): string {
 /** File of permanently banned models (400/404/410 discovered on the fly). */
 const DENYLIST_FILE = join(agentDir(), "auto-route-denylist.json");
 
-type Thinking = "off" | "low" | "medium" | "high" | "xhigh";
+type Thinking = ModelThinkingLevel;
 type TierName = "frontier" | "strong" | "standard" | "eco";
-const THINKING_ORDER: Thinking[] = ["off", "low", "medium", "high", "xhigh"];
+const THINKING_ORDER: readonly Thinking[] = [
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+];
 
 interface RouteState {
 	modelId: string;
@@ -84,18 +103,6 @@ interface RouteState {
 
 function modelKey(m: { provider: string; id: string }): string {
 	return `${m.provider}/${m.id}`;
-}
-
-function sameState(a: RouteState | undefined, b: RouteState): boolean {
-	if (!a) return false;
-	return (
-		a.modelId === b.modelId &&
-		a.providerId === b.providerId &&
-		a.thinking === b.thinking &&
-		a.avoid.length === b.avoid.length &&
-		a.avoid.every((v, i) => v === b.avoid[i]) &&
-		a.source === b.source
-	);
 }
 
 // Persistent denylist
@@ -128,73 +135,96 @@ function banPermanently(provider: string, modelId: string): void {
 	}
 }
 
-/** Permanent failure (model retired, 404/410, refuses training, unsupported region, disabled model access…). */
-export function isPermanentFailure(message: string): boolean {
-	return /no longer available|not found|\b404\b|\b410\b|ModelDeprecated|deprecated|discontinued|trains on request data|hosted outside Europe|requires Global regions|does not exist|no API implementation|unsupported|permission_error|model access is disabled|access to this model|do not have access/i.test(
-		message,
-	);
+/** Clears the in-memory and on-disk permanent denylist (used by tests). */
+export function resetDenylist(): void {
+	permanentDenylist.clear();
+	try {
+		rmSync(DENYLIST_FILE, { force: true });
+	} catch {
+		// best effort
+	}
+}
+
+// Error classification & pi-ai retry compatibility
+//
+// Inside `pi`, `@earendil-works/pi-ai` resolves via jiti; under `node --test`
+// without a local `node_modules/`, the dynamic import falls back to the exact
+// two regexes from `@earendil-works/pi-ai/dist/utils/retry.js`.
+
+const PI_NON_RETRYABLE_LIMIT_RE =
+	/GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|insufficient_quota|out of budget|quota exceeded|billing|subscription_sharing_usage_limit_exceeded|subscription_sharing_workplace_individual_usage_limit_exceeded|"code"\s*:\s*"?1308(?![0-9])/i;
+
+const PI_RETRYABLE_ERROR_RE =
+	/overloaded|server_busy|servers are currently busy|currently experiencing high demand|model is at capacity|rate.?limit|too many requests|(?<![a-z0-9])(?:429|500|502|503|504|520|524)(?![a-z0-9])|service.?(?:is.?)?(?:temporarily.?)?unavailable|server.?error|internal.?error|provider.?returned.?(?:an.?)?error|exceeded request buffer limit while retrying upstream|unable to forward upstream|upstream.?request.?failed|upstream_stream_read_error|stream was interrupted|http\/?2 stream failed|network.?error|connection.?error|connection.?refused|connection.?lost|connection.?closed|other side closed|fetch failed|request to \S+ failed, reason:|getaddrinfo|(?<![a-z0-9_])(?:ECONNRESET|ECONNABORTED|ECONNREFUSED|ETIMEDOUT|EPIPE)(?![a-z0-9_])|connection reset by peer|ENOTFOUND|EAI_AGAIN|upstream.?connect|reset before headers|socket hang up|socket connection was closed|timed? out|timeout|terminated|websocket.?closed|websocket.?error|websocket.?connection.?limit.?reached|ended without|stream ended before message_stop|stream ended before a terminal response event|http2 request did not get a response|stream disconnected before completion|cut short after the reply had begun|pending stream has been canceled|retry delay|you can retry your request|try your request again|please retry your request|ResourceExhausted|subscription_sharing_usage_unavailable|subscription_sharing_user_unavailable/i;
+
+function fallbackIsRetryableAssistantError(msg: AssistantMessage): boolean {
+	if (msg.stopReason !== "error" || !msg.errorMessage) return false;
+	if (PI_NON_RETRYABLE_LIMIT_RE.test(msg.errorMessage)) return false;
+	return PI_RETRYABLE_ERROR_RE.test(msg.errorMessage);
+}
+
+const isRetryableAssistantError: (msg: AssistantMessage) => boolean =
+	(await import("@earendil-works/pi-ai")
+		.then((m) => m.isRetryableAssistantError)
+		.catch(() => undefined)) ?? fallbackIsRetryableAssistantError;
+
+export type FailureKind = "permanent" | "model-access" | "provider-limit" | "transient";
+
+const MODEL_ACCESS_FAILURE_RE =
+	/429 model access|permission_error|model access is disabled|access to this model|do not have access|not enabled on this account/i;
+
+const PERMANENT_FAILURE_RE =
+	/\b404\b|\b410\b|no longer available|model[^\n]*not found|not found for api version|does not exist|ModelDeprecated|deprecated|discontinued|trains on request data|hosted outside Europe|requires Global regions|no API implementation|unsupported (?:model|region|location|country|feature|endpoint)/i;
+
+const PROVIDER_LIMIT_FAILURE_RE =
+	/gousagelimiterror|freeusagelimiterror|usage limit|available balance|insufficient balance|credit balance|insufficient_quota|out of budget|out of credit|quota|billing|subscription_sharing|resource_exhausted|"code"\s*:\s*"?1308(?![0-9])|rate.?limit|too many requests|(?<![a-z0-9])429(?![a-z0-9])/i;
+
+/**
+ * Classifies an assistant error message into one of four disjoint failure kinds:
+ * - `"model-access"`: account cannot use THIS model (403 permission_error) — ban
+ *   the model permanently, avoid the model alone, and rewrite into a retryable 429;
+ * - `"permanent"`: model retired, 404/410, policy/region rejection — ban the
+ *   model permanently;
+ * - `"provider-limit"`: provider-wide quota, balance, billing, or rate limit —
+ *   avoid the whole provider on retry, and rewrite when pi considers it non-retryable;
+ * - `"transient"`: everything else (5xx, network, request-specific 400…) — avoid
+ *   only the failed model for the current turn.
+ */
+export function classifyFailure(message: string): FailureKind {
+	if (MODEL_ACCESS_FAILURE_RE.test(message)) return "model-access";
+	if (PERMANENT_FAILURE_RE.test(message)) return "permanent";
+	if (PROVIDER_LIMIT_FAILURE_RE.test(message)) return "provider-limit";
+	return "transient";
 }
 
 /**
- * Any provider-wide limit (quota, rate limit, billing, bare 429): used on retry
- * to decide provider-wide avoidance — an account-level limit hits every model
- * of that provider, so failing over within it would fail again immediately.
- */
-export const PROVIDER_LIMIT_RE =
-	/gousagelimiterror|freeusagelimiterror|usage limit|available balance|credit balance|insufficient_quota|out of budget|out of credit|quota|billing|subscription_sharing|resource_exhausted|rate.?limit|too many requests|\b429\b/i;
-
-/**
- * The subset pi classifies as NON-retryable (its retry would never start, so
- * the turn dies). Only those get rewritten into a retryable 429 by
- * `toFailoverRetryMessage`; already-retryable errors (transient rate limits,
- * 5xx…) keep their original text untouched. Two families: provider-wide
- * quota/billing limits, and model access disabled on the account (a 403 the
- * provider never lifts for this key — same account, other models, still
- * usable, so the model alone is avoided and the turn continues elsewhere).
- */
-const NON_RETRYABLE_QUOTA_RE =
-	/gousagelimiterror|freeusagelimiterror|monthly usage limit reached|available balance|insufficient balance|credit balance|insufficient_quota|out of budget|out of credit|quota exceeded|exceeded your current quota|billing|subscription_sharing|resource_exhausted|permission_error|model access is disabled|access to this model|do not have access/i;
-
-/**
- * Model-access family (subset of NON_RETRYABLE_QUOTA_RE): the account cannot
- * use THIS model. Unlike a quota, other models of the same provider may still
- * work, so the retry avoids the model alone, not the whole provider.
- */
-const MODEL_ACCESS_RE =
-	/permission_error|model access is disabled|access to this model|do not have access|not enabled on this account/i;
-
-/**
- * Turns a provider-quota error into a "429" pi is willing to retry. Pi drops
- * these errors (retrying the same provider is pointless); under auto-route the
- * failover changes provider, so a retry becomes useful: pi then calls
- * `route(reason: "retry")` and the router switches. The rewritten text carries
- * pi's retryable "429" pattern and avoids its non-retryable ones (billing,
- * quota exceeded…); it also reads as a clear marker in the transcript.
- * Returns undefined when there is nothing to rewrite.
+ * Turns a non-retryable provider-quota or model-access error into a "429" pi is
+ * willing to retry. Pi drops these errors (retrying the same provider is
+ * pointless); under auto-route the failover changes provider or model, so a
+ * retry becomes useful: pi then calls `route(reason: "retry")` and the router
+ * switches. Already-retryable errors (transient 429 rate limits, Google
+ * `RESOURCE_EXHAUSTED` without billing/quota-exceeded wording, 5xx…) keep their
+ * original text untouched.
  */
 export function toFailoverRetryMessage(msg: AssistantMessage): AssistantMessage | undefined {
-	if (
-		msg.stopReason !== "error" ||
-		!msg.errorMessage ||
-		!msg.provider ||
-		!msg.model ||
-		!NON_RETRYABLE_QUOTA_RE.test(msg.errorMessage)
-	) {
+	if (msg.stopReason !== "error" || !msg.errorMessage) return undefined;
+	const kind = classifyFailure(msg.errorMessage);
+	if ((kind !== "provider-limit" && kind !== "model-access") || isRetryableAssistantError(msg)) {
 		return undefined;
 	}
-	const modelAccess = MODEL_ACCESS_RE.test(msg.errorMessage);
 	return {
 		...msg,
-		errorMessage: modelAccess
-			? `auto-route: 429 model access — ${msg.provider}/${msg.model} not enabled on this account; retrying on another model`
-			: `auto-route: 429 provider quota — ${msg.provider}/${msg.model} at limit; retrying on another model`,
+		errorMessage:
+			kind === "model-access"
+				? `auto-route: 429 model access — ${msg.provider}/${msg.model} not enabled on this account; retrying on another model`
+				: `auto-route: 429 provider quota — ${msg.provider}/${msg.model} at limit; retrying on another model`,
 	};
 }
 
 // Dynamic catalog
 
-function candidateModels(ctx: ExtensionContext): Model<never>[] {
-	return (ctx.modelRegistry.getAvailable() as Model<never>[]).filter((m) => {
+function candidateModels(ctx: ExtensionContext): Model<Api>[] {
+	return ctx.modelRegistry.getAvailable().filter((m) => {
 		if (permanentDenylist.has(modelKey(m))) return false;
 		if (EXCLUDED_MODEL_RE.test(m.id) || EXCLUDED_MODEL_RE.test(m.name)) return false;
 		// A model is free only when its pricing says so; missing pricing means
@@ -224,14 +254,13 @@ function buildTiers(ctx: ExtensionContext, avoid: string[] = []) {
 		if (Math.abs(ca - cb) < 0.01) return (b.contextWindow ?? 0) - (a.contextWindow ?? 0);
 		return cb - ca;
 	});
-	const at = (frac: number): Model<never> =>
+	const at = (frac: number): Model<Api> =>
 		sorted[Math.min(sorted.length - 1, Math.floor(frac * sorted.length))];
 	return {
 		frontier: at(0),
 		strong: at(0.33),
 		standard: at(0.66),
 		eco: sorted[sorted.length - 1],
-		background: sorted[sorted.length - 1],
 	} as const;
 }
 
@@ -240,17 +269,13 @@ function buildTiers(ctx: ExtensionContext, avoid: string[] = []) {
 function setStatusLine(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
-	m: Model<never>,
+	m: Model<Api>,
 	thinking: Thinking,
 	source?: string,
 ): void {
 	const shown = source ?? "local";
-	try {
-		const dim = ctx.ui.theme?.fg?.bind(ctx.ui.theme) ?? ((_: string, s: string) => s);
-		ctx.ui.setStatus("auto", dim("dim", `⚡ ${modelKey(m)} · ${thinking} · ${shown}`));
-	} catch {
-		ctx.ui.setStatus("auto", `${modelKey(m)} · ${thinking} · ${shown}`);
-	}
+	const text = `⚡ ${modelKey(m)} · ${thinking} · ${shown}`;
+	ctx.ui.setStatus("auto", ctx.ui.theme ? ctx.ui.theme.fg("dim", text) : text);
 	pi.events.emit("auto-route:routed", {
 		provider: m.provider,
 		modelId: m.id,
@@ -262,21 +287,16 @@ function setStatusLine(
 function toRoute(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
-	m: Model<never>,
+	m: Model<Api>,
 	thinking: Thinking,
 	source: string | undefined,
-	prevState?: RouteState,
-	nextState?: RouteState,
+	state?: RouteState,
 ): ModelRoute<RouteState> {
 	setStatusLine(pi, ctx, m, thinking, source);
-	// Only return a new state object when it actually changed (avoids writing a
-	// session-tree entry on every continuation request).
-	const stateToStore =
-		nextState && !sameState(prevState, nextState) ? nextState : undefined;
 	return {
 		model: m,
 		thinkingLevel: thinking,
-		state: stateToStore,
+		state,
 	};
 }
 
@@ -353,7 +373,10 @@ export function tierAndThinking(score: number): { tier: TierName; thinking: Thin
 }
 
 function capThinking(auto: Thinking, userSelected: Thinking): Thinking {
-	return THINKING_ORDER[Math.min(THINKING_ORDER.indexOf(auto), THINKING_ORDER.indexOf(userSelected))];
+	const autoIdx = THINKING_ORDER.indexOf(auto);
+	const userIdx = THINKING_ORDER.indexOf(userSelected);
+	if (autoIdx === -1 || userIdx === -1) return auto;
+	return THINKING_ORDER[Math.min(autoIdx, userIdx)];
 }
 
 // Hybrid classifier (optional; auto-detected, silent fallback)
@@ -374,6 +397,38 @@ const CHOICE_TO_TIER: Record<string, { tier: TierName; thinking: Thinking }> = {
 };
 
 /**
+ * Providers whose zero-cost classifiers accept another provider's API key per
+ * request. OpenCode's free classifier (opencode/jev-1.13-free) lives under
+ * "opencode" in pi's catalog yet accepts an "opencode-go" key at zero cost:
+ * passing that key per request unlocks Jev for Go users without enabling
+ * "opencode" globally (which would flood /model with pay-as-you-go Zen chat
+ * models that fail with HTTP 402).
+ */
+const BORROWED_CLASSIFIER_KEYS: ReadonlyArray<{
+	targetProvider: string;
+	keyProvider: string;
+}> = [{ targetProvider: "opencode", keyProvider: "opencode-go" }];
+
+async function borrowedFreeClassifiers(
+	ctx: ExtensionContext,
+	available: readonly ClassifierModel<ClassifierApi>[],
+): Promise<Array<{ model: ClassifierModel<ClassifierApi>; apiKey: string }>> {
+	const borrowed: Array<{ model: ClassifierModel<ClassifierApi>; apiKey: string }> = [];
+	for (const { targetProvider, keyProvider } of BORROWED_CLASSIFIER_KEYS) {
+		if (available.some((m) => m.provider === targetProvider)) continue;
+		const freeModels = ctx.modelRegistry
+			.getModelsOfType("classifier", targetProvider)
+			.filter((m) => m.cost?.input === 0);
+		if (freeModels.length === 0) continue;
+		const apiKey = await ctx.modelRegistry.getApiKeyForProvider(keyProvider);
+		if (apiKey) {
+			for (const model of freeModels) borrowed.push({ model, apiKey });
+		}
+	}
+	return borrowed;
+}
+
+/**
  * Asks an available classifier model to sort a turn into a tier: the catalog is
  * auto-detected across every provider with working credentials, free
  * classifiers first, then the cheaper ones. Only the user prompt is sent,
@@ -390,24 +445,10 @@ export async function classifyTier(
 ): Promise<TierDecision | undefined> {
 	try {
 		const available = (await ctx.modelRegistry.getAvailableOfType("classifier")) ?? [];
-		const candidates: Array<{ model: (typeof available)[number]; apiKey?: string }> =
-			available.map((model) => ({ model }));
-		// OpenCode's free classifier (opencode/jev-1.13-free) lives under the
-		// "opencode" provider in pi's catalog, yet accepts an "opencode-go" key
-		// at zero cost. Passing that key per request unlocks Jev for Go users
-		// without enabling "opencode" globally (which would flood /model with
-		// pay-as-you-go Zen chat models that fail with HTTP 402).
-		if (!candidates.some((c) => c.model.provider === "opencode")) {
-			const freeOc = (ctx.modelRegistry.getModelsOfType?.("classifier", "opencode") ?? []).filter(
-				(m) => m.cost?.input === 0,
-			);
-			if (freeOc.length > 0) {
-				const goKey = await ctx.modelRegistry.getApiKeyForProvider?.("opencode-go");
-				if (goKey) {
-					for (const model of freeOc) candidates.push({ model, apiKey: goKey });
-				}
-			}
-		}
+		const candidates: Array<{ model: ClassifierModel<ClassifierApi>; apiKey?: string }> = [
+			...available.map((model) => ({ model })),
+			...(await borrowedFreeClassifiers(ctx, available)),
+		];
 		if (candidates.length === 0) return undefined;
 		// Free classifiers first, then ascending input cost; unknown pricing
 		// ranks last. Array sort is stable, so the catalog order survives.
@@ -450,7 +491,7 @@ export async function classifyTier(
 		if (answer?.type !== "choice") return undefined;
 		const decision = CHOICE_TO_TIER[answer.choice];
 		if (!decision) return undefined;
-		const probability = answer.probabilities[answer.choice] ?? answer.confidence ?? 0;
+		const probability = answer.probabilities[answer.choice] ?? answer.confidence;
 		if (probability < 0.5) return undefined;
 		return { ...decision, via: modelKey(picked.model) };
 	} catch {
@@ -472,12 +513,7 @@ function editedThisTurn(messages: readonly Message[]): boolean {
 	const lastUser = messages.findLastIndex((m) => m.role === "user");
 	return messages
 		.slice(lastUser + 1)
-		.some(
-			(m) =>
-				m.role === "toolResult" &&
-				EDIT_TOOLS.has((m as { toolName?: string }).toolName ?? "") &&
-				!(m as { isError?: boolean }).isError,
-		);
+		.some((m) => m.role === "toolResult" && EDIT_TOOLS.has(m.toolName) && !m.isError);
 }
 
 /**
@@ -493,7 +529,6 @@ async function rerouteCurrentTurn(
 	request: ModelRouteRequest<RouteState>,
 	avoid: string[],
 	userCap: Thinking,
-	prevState?: RouteState,
 ): Promise<ModelRoute<RouteState>> {
 	const text = lastUserText(request.messages);
 	// Classifier first; the local bilingual heuristic is the silent fallback.
@@ -510,7 +545,7 @@ async function rerouteCurrentTurn(
 	}
 	const th = capThinking(thinking, userCap);
 	const m = buildTiers(ctx, avoid)[tier];
-	return toRoute(pi, ctx, m, th, source, prevState, {
+	return toRoute(pi, ctx, m, th, source, {
 		modelId: m.id,
 		providerId: m.provider,
 		thinking: th,
@@ -522,13 +557,17 @@ async function rerouteCurrentTurn(
 export default function (pi: ExtensionAPI) {
 	// Pi does NOT trigger `route(reason: "retry")` on 400/404 errors nor on
 	// provider-quota 429s (non-retryable classes). We listen to `message_end` to:
-	// 1. permanently ban models with permanent failures (400/404/410…);
-	// 2. rewrite quota 429s into a retryable error, so pi starts its retry →
-	//    route(reason: "retry") → cross-provider failover instead of a dead turn.
+	// 1. permanently ban models with permanent failures (404/410, retired models,
+	//    disabled model access…) — passively even when a physical model is
+	//    selected outside `auto/auto`, so the denylist learns dead endpoints
+	//    opportunistically;
+	// 2. rewrite quota/access errors into a retryable 429 when `auto/auto` is
+	//    active, so pi starts its retry → route(reason: "retry") → failover.
 	pi.on("message_end", (event, ctx) => {
 		const msg = event.message as AssistantMessage;
 		if (msg?.role !== "assistant" || msg.stopReason !== "error" || !msg.errorMessage) return;
-		if (isPermanentFailure(msg.errorMessage) && msg.provider && msg.model) {
+		const kind = classifyFailure(msg.errorMessage);
+		if (kind === "permanent" || kind === "model-access") {
 			banPermanently(msg.provider, msg.model);
 		}
 		if (ctx.model?.provider === "auto" && ctx.model?.id === "auto") {
@@ -554,78 +593,85 @@ export default function (pi: ExtensionAPI) {
 		contextWindow: 200_000,
 		maxTokens: 64_000,
 		async route(request, ctx) {
-			const userCap = (request.thinkingLevel ?? "xhigh") as Thinking;
+			const userCap = request.thinkingLevel;
 
 			// Compaction/summaries outside the agent loop: no session state.
 			if (request.reason === "direct") {
 				return {
-					model: buildTiers(ctx).background,
+					model: buildTiers(ctx).eco,
 					thinkingLevel: "low",
 				};
 			}
 
 			const prevState = request.state;
 
-			// RETRY / failover (429 / 5xx)
-			if (request.reason === "retry" && request.failed) {
-				const failedKey = modelKey(request.failed.model);
-				if (isPermanentFailure(request.failed.message?.errorMessage ?? "")) {
-					banPermanently(request.failed.model.provider, request.failed.model.id);
+			// RETRY / failover (429 / 5xx, or router-level retry when `failed` is absent)
+			if (request.reason === "retry") {
+				let avoid = prevState?.avoid ?? [];
+				if (request.failed) {
+					const failedKey = modelKey(request.failed.model);
+					const kind = classifyFailure(request.failed.message?.errorMessage ?? "");
+					if (kind === "permanent" || kind === "model-access") {
+						banPermanently(request.failed.model.provider, request.failed.model.id);
+					}
+					// Model access disabled on the account: a per-model problem — other
+					// models of the same provider may still work, so avoid the model
+					// alone. Provider limit: avoid the whole provider, otherwise the
+					// failover lands on another of its models and fails again at once.
+					const avoidEntry =
+						kind === "provider-limit" ? request.failed.model.provider : failedKey;
+					avoid = [...new Set([...avoid, avoidEntry])];
 				}
-				const baseState: RouteState = prevState ?? {
-					modelId: request.failed.model.id,
-					providerId: request.failed.model.provider,
-					thinking: (request.failed.thinkingLevel ?? "medium") as Thinking,
-					avoid: [],
-				};
-				const avoid = [
-					...new Set([
-						...baseState.avoid,
-						// Model access disabled on the account: a per-model problem — other
-						// models of the same provider may still work, so avoid the model
-						// alone. Provider quota: avoid the whole provider, otherwise the
-						// failover lands on another of its models and fails again at once.
-						MODEL_ACCESS_RE.test(request.failed.message?.errorMessage ?? "")
-							? failedKey
-							: PROVIDER_LIMIT_RE.test(request.failed.message?.errorMessage ?? "")
-								? request.failed.model.provider
-								: failedKey,
-					]),
-				];
 				const tiers = buildTiers(ctx, avoid);
 				const ladder: TierName[] =
-					avoid.length >= 3 ? ["standard", "eco"] : ["strong", "standard", "eco"];
+					avoid.length >= DEGRADE_AFTER_FAILURES
+						? ["standard", "eco"]
+						: ["strong", "standard", "eco"];
 				const chosen =
 					ladder
 						.map((t) => tiers[t])
-						.find((m) => m && !avoid.includes(modelKey(m)) && !avoid.includes(m.provider)) ??
-					tiers.frontier;
-				const th = capThinking(baseState.thinking, userCap);
-				return toRoute(pi, ctx, chosen, th, baseState.source, prevState, {
-					...baseState,
+						.find((m) => !avoid.includes(modelKey(m)) && !avoid.includes(m.provider)) ??
+					tiers.eco;
+				const baseThinking = prevState?.thinking ?? request.failed?.thinkingLevel ?? "medium";
+				const th = capThinking(baseThinking, userCap);
+				const source = prevState?.source;
+				return toRoute(pi, ctx, chosen, th, source, {
 					modelId: chosen.id,
 					providerId: chosen.provider,
 					thinking: th,
 					avoid,
+					source,
 				});
 			}
 
 			// CONTINUATION (same turn, after tool calls)
 			if (request.reason === "continuation" && prevState) {
-				const avoid = prevState.avoid ?? [];
+				const { avoid } = prevState;
 
 				// First successful edit/write of the turn → switch to the eco tier for
 				// the rest of the turn (editedThisTurn stays true: toolResults accumulate).
 				if (editedThisTurn(request.messages)) {
 					const eco = buildTiers(ctx, avoid).eco;
 					const th = capThinking("medium", userCap);
-					return toRoute(pi, ctx, eco, th, prevState.source, prevState, {
-						...prevState,
-						modelId: eco.id,
-						providerId: eco.provider,
-						thinking: th,
-						avoid,
-					});
+					const changed =
+						prevState.modelId !== eco.id ||
+						prevState.providerId !== eco.provider ||
+						prevState.thinking !== th;
+					return toRoute(
+						pi,
+						ctx,
+						eco,
+						th,
+						prevState.source,
+						changed
+							? {
+									...prevState,
+									modelId: eco.id,
+									providerId: eco.provider,
+									thinking: th,
+								}
+							: undefined,
+					);
 				}
 
 				// No edit yet → keep the current model to preserve the prompt cache
@@ -637,24 +683,26 @@ export default function (pi: ExtensionAPI) {
 					!avoid.includes(currentKey) &&
 					!avoid.includes(prevState.providerId)
 				) {
-					const m = ctx.modelRegistry.find(prevState.providerId, prevState.modelId) as
-						| Model<never>
-						| undefined;
+					const m = ctx.modelRegistry.find(prevState.providerId, prevState.modelId);
 					if (m) {
 						const th = capThinking(prevState.thinking, userCap);
-						return toRoute(pi, ctx, m, th, prevState.source, prevState, {
-							...prevState,
-							thinking: th,
-						});
+						return toRoute(
+							pi,
+							ctx,
+							m,
+							th,
+							prevState.source,
+							th !== prevState.thinking ? { ...prevState, thinking: th } : undefined,
+						);
 					}
 				}
 				// Safety fallback: current model banned/missing → re-route the SAME
 				// turn (classifier or local score on the current message, `avoid` kept).
-				return await rerouteCurrentTurn(pi, ctx, request, prevState.avoid, userCap, prevState);
+				return await rerouteCurrentTurn(pi, ctx, request, avoid, userCap);
 			}
 
 			// NEW TURN (user message): one classifier call, else the local heuristic.
-			return await rerouteCurrentTurn(pi, ctx, request, [], userCap, prevState);
+			return await rerouteCurrentTurn(pi, ctx, request, [], userCap);
 		},
 	});
 }

@@ -62,6 +62,8 @@ function loadCtx(
 			requestedTypes.push(type);
 			return models;
 		},
+		getModelsOfType: () => [],
+		getApiKeyForProvider: async () => undefined,
 		classify,
 	};
 	const ctx: any = { modelRegistry, classify };
