@@ -1,27 +1,54 @@
 # auto-route
 
-A virtual model for [pi](https://github.com/earendil-works/pi-coding-agent) that routes every turn to the right physical model by task difficulty and adjusts the thinking level, to cut token spend without losing quality.
+A virtual model for [pi](https://github.com/earendil-works/pi-coding-agent) that sends every request to the right physical model based on how hard the task looks, to cut token spend without losing quality.
 
 ![harness](https://img.shields.io/badge/harness-pi--coding--agent-blue)
 
-**pi-specific.** This extension uses pi's extension API (`pi.registerVirtualModel`, `ModelRegistry`). It does not port as-is to Claude Code, Codex or other harnesses; see [Portability](#portability) for close equivalents.
+**pi-specific.** This extension uses pi's extension API (`pi.registerVirtualModel`, `ModelRegistry`); it does not port as-is to Claude Code, Codex or other harnesses. See [Portability](#portability).
+
+## Install
+
+```bash
+pi install npm:pi-auto-route
+```
+
+Then in pi: `/reload`, and pick **auto → auto** in the model selector (`/model`). It shows up as "Auto (routing + thinking + failover)".
+
+- update: `pi update --extensions`
+- remove: `pi remove npm:pi-auto-route`
+- without npm: `pi install git:github.com/rzph/pi-auto-route`, or copy `auto-route.ts` into `~/.pi/agent/extensions/` by hand
+
+Selecting `auto` starts at thinking `low`. That level is a **ceiling**, not a target: raise it with `shift+tab` when you want the router to think harder.
+
+## Usage
+
+Once selected, you do nothing else. On every turn the router picks a model on its own and shows one discreet status line: `⚡ provider/model · thinking`.
+
+Three things worth knowing up front:
+
+- **Language.** The difficulty heuristic scores your message with regex patterns written for **French**: action verbs (`reprend`, `modifie`, `corrige`…), explicit intent (`je veux`, `peux-tu`…), questions (`pourquoi`, `comment ça marche`…). On English prompts those signals rarely fire, so messages score lower than they should and land in the light tiers more often. Paths, code blocks, message length and the terminal-paste penalty are language-neutral, so the router still works — just less precisely. English patterns are welcome as a contribution.
+- **One switch per turn.** The first model plans and makes the first `edit`/`write`; the rest of the turn runs on the cheapest tier. The prompt cache therefore breaks only once per turn, which is why the trade-off favours turns with several tool calls.
+- **You stay in control.** `/model` to any real model takes over immediately; switch back to `auto` on the next turn to resume routing. To force one model for a single turn, switch away and back.
+
+## Requirements
+
+- pi with at least one provider that has valid credentials. Nothing is hardcoded to a specific provider: the candidate catalog, the tiers and the failover are all built from your own model registry at runtime.
+- No API key of its own and no network calls: the difficulty heuristic runs entirely locally.
+- Only to run the test suite: Node.js 22.6 or newer (`node --test *.test.ts`).
 
 ## How it works
 
-Pick **auto → auto** in the model selector (`/model`). Then, on every turn:
+On each turn, in order:
 
-1. **Difficulty estimate** (local heuristic, no external API): a cited path or repo, action verbs ("resume", "modify", "find"…), explicit intent ("I want"), a conceptual question, keyword matches (debugging, architecture…), length, code, a terminal-paste penalty → a continuous score from 0 to 1. Calibrated on 880 real turns (see `heuristics.test.ts`); read the numbers honestly:
-   - heaviest-quartile messages sent to `eco`: **195/220 → 72/220** (the real win: less under-routing);
-   - Spearman score vs. tool calls: +0.16 → **+0.28**;
-   - overall quartile agreement: **30 % against 25 % for chance** — the score is an *asymmetric umbrella* (it shields heavy messages from the `eco` tier and at worst bumps simple ones one step), not a precise classifier. Do not overestimate fine-grained prediction.
-2. **Tier choice** inside YOUR real catalog (discovered at runtime via `getAvailable()`, nothing hardcoded):
+1. **Score the message.** A local heuristic reads your last message and produces a score from 0 to 1. Signals of real work: a path or repo, action verbs, explicit intent, a conceptual question, code blocks, length. A terminal paste (three or more `$`/`sudo` lines) is penalised — a wall of shell output is not a hard task.
+2. **Pick a tier.** Your model catalog is sorted by output cost, used as a proxy for capacity (ties broken by the larger context window), and split into four tiers:
    - score ≥ 0.7 — heavy work, several signals → most capable tier, thinking `xhigh`
    - score ≥ 0.5 → strong tier, thinking `high`
    - score ≥ 0.3 → standard tier, thinking `medium`
    - score < 0.3 — short follow-ups, quick questions → lightest tier, thinking `low`
-3. **One switch per turn**: the starting model plans and makes the first `edit`/`write`; the rest of the turn continues on the lightest model. The prompt cache breaks only once per turn.
+3. **Hand off after the first edit.** The chosen model plans and makes the first `edit`/`write`; the turn continues on the lightest tier (see Usage).
 4. **Compaction and invisible summaries** always go to the lightest model — the token leak nobody sees.
-5. **Automatic failover instead of a crash**: a timeout or overload (429/5xx) moves to the next model of the ladder; a **429 "provider quota"** error (which pi treats as non-retryable) is rewritten into a retryable one, and the router then avoids the **whole provider** — the turn continues instead of dying. Permanent errors (400/404/410) ban the model through the denylist. See `failover.test.ts`.
+5. **Failover instead of a crash.** A timeout or overload (429/5xx) moves to the next model of the ladder. A **429 provider-quota** error — which pi treats as non-retryable, so the turn would die — is rewritten into a retryable one, and the router then avoids the **whole provider**: the turn continues on another provider instead. Permanent errors (400/404/410, and messages like "trains on request data" or "unsupported region") ban the model persistently. See `failover.test.ts`.
 
 ### Excluded from the candidates
 
@@ -31,55 +58,36 @@ Pick **auto → auto** in the model selector (`/model`). Then, on every turn:
 - **`contributor`** models (OpenCode endpoints that train on your requests);
 - retired or deprecated generations: `gemini-2.5-*` (Google 404), `mimo-v2.5` (OpenCode 410);
 - specialized non-code models (`computer-use`, `robotics`, `deep-research`);
-- anything listed in pi's agent dir as `auto-route-denylist.json` (`$PI_CODING_AGENT_DIR` if set, else `~/.pi/agent/`) — banned automatically and **persistently** as soon as it returns a permanent error (400/404/410, "trains on request data", unsupported region…). Delete an entry from the file to restore a model.
+- anything in pi's agent dir as `auto-route-denylist.json` (`$PI_CODING_AGENT_DIR` if set, else `~/.pi/agent/`) — models banned automatically and **persistently** as soon as they return a permanent error. Delete an entry from the file to restore a model.
 
-Capacity ranking uses **output cost** as a proxy (ties broken by the largest contextWindow). A model is excluded as free only when its pricing says 0; missing pricing means unknown and stays a candidate, ranked at a mid cost. An empty tier falls back to the next one; if everything fails, you get an explicit error.
-
-## Requirements
-
-- pi with at least one provider that has valid credentials. Nothing is hardcoded to a specific provider: the candidate catalog, the tiers and the failover are all built from your own model registry at runtime.
-- No API key of its own and no network calls: the difficulty heuristic runs entirely locally.
-- Only to run the test suite: Node.js 22.6 or newer (`node --test *.test.ts`).
-
-## Install
-
-```bash
-pi install npm:pi-auto-route
-```
-
-Then `/reload` and pick **auto → auto** in the model selector (`/model`). Updates come with `pi update --extensions`; removal with `pi remove npm:pi-auto-route`.
-
-Without npm, a local checkout works too: `pi install git:github.com/rzph/pi-auto-route`, or copy `auto-route.ts` into `~/.pi/agent/extensions/` by hand.
-
-
-```bash
-# for the session:
-pi -e /path/to/auto-route.ts
-
-# or permanent (loaded at every pi start):
-cp /path/to/auto-route.ts ~/.pi/agent/extensions/auto-route.ts
-```
-
-Then `/model` → **auto → auto** (shown as "Auto (routing + thinking + failover)"). Selecting it starts at thinking **`low`** — that level is a ceiling: raise it with `shift+tab` when you want the router to think harder.
+A model is excluded as free only when its pricing says 0; missing pricing means unknown and stays a candidate, ranked at a mid cost. An empty tier falls back to the next one; if everything fails, you get an explicit error.
 
 ## Customize
 
-Everything is set at the top of the file:
+Everything is set at the top of `auto-route.ts`:
 
 - `difficultyScore()`: the heuristic (signals plus length thresholds) — each signal is one commented regex; recalibrate and run `node --test *.test.ts` after any change (`heuristics.test.ts` for the score, `failover.test.ts` for the 429 handling and the default thinking);
 - `tierAndThinking()`: the score → tier + thinking mapping;
 - the filter in `candidateModels()` if you want free or non-reasoning models back.
 
-To force one specific model for a single turn: switch to a real model with `/model`, then back to `auto` on the next turn.
+## Calibration details
+
+The heuristic is a hand-written rule, not a trained model; the numbers below only measure it. They come from 880 real turns taken from local session logs (see `heuristics.test.ts`), comparing v1 against the current rule:
+
+- heaviest-quartile messages sent to the `eco` tier: **195/220 → 72/220** (the real win: less under-routing);
+- Spearman correlation between score and tool calls: **+0.16 → +0.28**;
+- overall quartile agreement: **30 % against 25 % for chance**.
+
+Read that last figure honestly: the score is an **asymmetric umbrella** — it shields heavy messages from the `eco` tier and at worst bumps a simple one step up. It is not a precise classifier of difficulty, and fine-grained prediction should not be expected from it.
 
 ## Portability
 
 - **pi**: supported (this extension).
-- **Claude Code**: not portable; close ideas: `jev-router` (gargpratyush), "model-router" skills (Claude Code internals).
+- **Claude Code**: not portable; close ideas: `jev-router` (gargpratyush), "model-router" skills.
 - **Codex**: not portable; `jev-codex-router` (0xNatoshi): model + thinking per turn.
 - **Hermes**: not portable; `hermes-jev-skills` (kerpopule).
 
-The idea (plan strong, execute cheap, one switch per turn, degenerate compaction on a light model) ports everywhere; this implementation is tied to pi. Want a port for another harness? Open an issue.
+The idea (plan strong, execute cheap, one switch per turn, compaction on a light model) ports everywhere; this implementation is tied to pi. Want a port for another harness? Open an issue.
 
 ## Key concepts
 
