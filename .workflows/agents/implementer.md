@@ -1,6 +1,6 @@
 ---
 description: The implementer of `workflows thermoloop`. It implements the handoff of each round.
-model: opencode-go/gemini-4-argon
+model: opencode-go/glm-5.3
 thinking: medium
 ---
 You are a session of a workflows run, not the user's main agent. The run keeps its own memory in your prompts, so do
