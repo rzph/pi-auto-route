@@ -88,6 +88,7 @@ function toRoute(
 	thinking: Thinking,
 	state?: RouteState,
 ): ModelRoute<RouteState> {
+	lastRouted = `${m.provider}/${m.id}`;
 	ctx.ui.setStatus(
 		"auto-route",
 		`auto → ${m.provider}/${m.id} · thinking ${thinking}`,
@@ -163,6 +164,39 @@ function key(m: Model<never>): string {
 	return `${m.provider}/${m.id}`;
 }
 
+// ---------- Capteur de quota (en-têtes de réponse) ----------
+
+const QUOTA_RE = /limit|ratelimit|rate-limit|remaining|reset|quota|budget|usage/i;
+let lastRouted = "?";
+let headersLogged = false;
+
+function captureHeaders(pi: ExtensionAPI) {
+	pi.on("after_provider_response", (event, ctx) => {
+		// Premier batch : tout logguer pour découvrir ce que le fournisseur expose.
+		if (!headersLogged) {
+			headersLogged = true;
+			try {
+				// eslint-disable-next-line no-console
+				console.error(
+					`[auto-route] headers de ${lastRouted} (status ${event.status}) :\n` +
+						Object.entries(event.headers)
+							.map(([k, v]) => `  ${k}: ${v}`)
+							.join("\n"),
+				);
+			} catch {
+				// stderr peut être indisponible selon le mode d'exécution.
+			}
+		}
+		const quota = Object.entries(event.headers).filter(([k]) => QUOTA_RE.test(k));
+		if (quota.length > 0) {
+			ctx.ui.setStatus(
+				"auto-route-quota",
+				quota.map(([k, v]) => `${k.replace(/^x-/i, "")}=${v}`).join(" · "),
+			);
+		}
+	});
+}
+
 // Adaptateur : garde les appels courts au fil des routes.
 function R(
 	request: Req,
@@ -175,6 +209,7 @@ function R(
 }
 
 export default function (pi: ExtensionAPI) {
+	captureHeaders(pi);
 	pi.registerVirtualModel<RouteState>({
 		provider: "auto",
 		id: "auto",
