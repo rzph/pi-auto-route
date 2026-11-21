@@ -2,7 +2,7 @@
 
 A virtual model for [pi](https://github.com/earendil-works/pi-coding-agent) that sends every request to the right physical model based on how hard the task looks, to cut token spend without losing quality.
 
-![harness](https://img.shields.io/badge/harness-pi--coding--agent-blue)
+[![npm](https://img.shields.io/npm/v/pi-auto-route)](https://www.npmjs.com/package/pi-auto-route) ![harness](https://img.shields.io/badge/harness-pi--coding--agent-blue)
 
 **pi-specific.** This extension uses pi's extension API (`pi.registerVirtualModel`, `ModelRegistry`); it does not port as-is to Claude Code, Codex or other harnesses. See [Portability](#portability).
 

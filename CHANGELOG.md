@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.1
+
+- npm version badge and package link in the README.
+- Releases now publish to npm through trusted publishing (GitHub Actions OIDC): pushing a `v*` tag publishes the matching package.json version, no npm token on disk.
+
 ## 1.3.0
 
 - Bilingual heuristic: every signal regex gained English alternations; the French patterns stay. Paths, code blocks, message length and the terminal-paste penalty were already language-neutral.
