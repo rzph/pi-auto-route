@@ -46,8 +46,16 @@ type Req = ModelRouteRequest<RouteState>;
 
 // ---------- Catalogue dynamique ----------
 
+/**
+ * Fournisseurs exclus par défaut. opencode-go entraîne sur les requêtes
+ * (sauf réglage explicite côté OpenCode) : incompatible avec un usage
+ * orienté vie privée. Retire-le de la liste seulement en connaissance de cause.
+ */
+const EXCLUDED_PROVIDERS = new Set<string>(["opencode-go"]);
+
 function candidateModels(ctx: ExtensionContext): Model<never>[] {
 	return (ctx.modelRegistry.getAvailable() as Model<never>[]).filter((m) => {
+		if (EXCLUDED_PROVIDERS.has(m.provider)) return false;
 		const free =
 			/free/i.test(m.name) ||
 			/free/i.test(m.id) ||
