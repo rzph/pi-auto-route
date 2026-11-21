@@ -1,21 +1,19 @@
 /**
  * auto-route — modèle virtuel `auto/auto` : routage automatique complet.
  *
- * Sélectionné via /model → « auto » :
- * - candidats = TOUS les modèles chat reasoning payants dont le provider
- *   a des credentials valides (gratuits exclus : quotas/timeout) ;
- * - paliers de capacité bâtis au runtime (coût de sortie comme proxy) ;
- * - difficulté estimée localement → palier + niveau de thinking ;
- * - le thinking sélectionné dans /model agit comme PLAFOND : tu peux
- *   toujours baisser, le routeur ne dépasse jamais ton choix ;
- * - FAILOVER : en cas d'échec (timeout, quota, erreur réseau), la retry
- *   part sur un autre modèle du même palier, puis sur un palier
- *   inférieur si ça récidive — l'échec et son modèle sont exclus ;
- * - le modèle physique courant est affiché dans la barre de statut ;
- * - une bascule de modèle max par tour (cache de prompt préservé) ;
+ * /model → « auto » :
+ * - candidats = modèles chat reasoning payants, credentials valides,
+ *   moins les fournisseurs exclus (voir EXCLUDED_PROVIDERS) ;
+ * - paliers de capacité au runtime (coût de sortie ≈ proxy) ;
+ * - difficulté estimée localement → palier + thinking ;
+ * - le thinking choisi dans pi agit comme PLAFOND ;
+ * - failover : échec → autre modèle du même palier ; 3 échecs → palier
+ *   inférieur. Les erreurs « modèle retiré / indisponible » bannissent
+ *   le modèle PERSISTAMMENT (fichier denylist partagé entre sessions) ;
+ * - UNE ligne de statut max, discrète ;
+ * - une bascule de modèle max par tour (cache de prompt) ;
  * - compaction/résumés → le plus léger.
  *
- * Pi-spec (pi.registerVirtualModel, ModelRegistry, ctx.ui.setStatus).
  * Usage : pi -e ~/.pi/agent/extensions/auto-route.ts puis /model → auto
  */
 
@@ -28,7 +26,20 @@ import type {
 	ModelRouteRequest,
 } from "@earendil-works/pi-coding-agent";
 
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+
 const EDIT_TOOLS = new Set(["edit", "write"]);
+
+/**
+ * Fournisseurs exclus par défaut. opencode-go entraîne sur les requêtes
+ * (sauf réglage explicite côté OpenCode) : incompatible avec un usage
+ * orienté vie privée.
+ */
+const EXCLUDED_PROVIDERS = new Set<string>(["opencode-go"]);
+
+/** Fichier des modèles bannis définitivement (retirés, 404, …). */
+const DENYLIST_FILE = `${process.env.HOME ?? ""}/.pi/agent/auto-route-denylist.json`;
 
 type Thinking = "off" | "low" | "medium" | "high" | "xhigh";
 const THINKING_ORDER: Thinking[] = ["off", "low", "medium", "high", "xhigh"];
@@ -38,24 +49,47 @@ interface RouteState {
 	modelId: string;
 	providerId: string;
 	thinking: Thinking;
-	/** provider/id des modèles exclus par échec dans ce tour. */
+	/** provider/id exclus pour CE tour (échecs transitoires). */
 	avoid: string[];
 }
 
 type Req = ModelRouteRequest<RouteState>;
 
+// ---------- Denylist persistante ----------
+
+function loadDenylist(): Set<string> {
+	try {
+		const raw = JSON.parse(readFileSync(DENYLIST_FILE, "utf8")) as string[];
+		return new Set(Array.isArray(raw) ? raw : []);
+	} catch {
+		return new Set();
+	}
+}
+
+function saveDenylist(set: Set<string>): void {
+	try {
+		mkdirSync(dirname(DENYLIST_FILE), { recursive: true });
+		writeFileSync(DENYLIST_FILE, JSON.stringify([...set], null, 1));
+	} catch {
+		// best effort
+	}
+}
+
+const permanentDenylist = loadDenylist();
+
+/** Erreur définitive (modèle retiré, indisponible) vs transitoire (timeout…). */
+function isPermanentFailure(message: string): boolean {
+	return /no longer available|not found|invalid_request_error|does not exist|deprecated|discontinued/i.test(
+		message,
+	);
+}
+
 // ---------- Catalogue dynamique ----------
 
-/**
- * Fournisseurs exclus par défaut. opencode-go entraîne sur les requêtes
- * (sauf réglage explicite côté OpenCode) : incompatible avec un usage
- * orienté vie privée. Retire-le de la liste seulement en connaissance de cause.
- */
-const EXCLUDED_PROVIDERS = new Set<string>(["opencode-go"]);
-
 function candidateModels(ctx: ExtensionContext): Model<never>[] {
+	const excluded = new Set([...EXCLUDED_PROVIDERS, ...permanentDenylist]);
 	return (ctx.modelRegistry.getAvailable() as Model<never>[]).filter((m) => {
-		if (EXCLUDED_PROVIDERS.has(m.provider)) return false;
+		if (excluded.has(m.provider) || excluded.has(`${m.provider}/${m.id}`)) return false;
 		const free =
 			/free/i.test(m.name) ||
 			/free/i.test(m.id) ||
@@ -65,13 +99,8 @@ function candidateModels(ctx: ExtensionContext): Model<never>[] {
 }
 
 function buildTiers(ctx: ExtensionContext, avoid: string[] = []) {
-	const pool = candidateModels(ctx).filter(
-		(m) => !avoid.includes(`${m.provider}/${m.id}`),
-	);
-	if (pool.length === 0) {
-		// Tout est exclu : on retente sans exclusions plutôt que de mourir.
-		return buildTiers(ctx, []);
-	}
+	let pool = candidateModels(ctx).filter((m) => !avoid.includes(`${m.provider}/${m.id}`));
+	if (pool.length === 0) pool = candidateModels(ctx);
 	const sorted = [...pool].sort((a, b) => {
 		const ca = a.cost?.output ?? 0;
 		const cb = b.cost?.output ?? 0;
@@ -89,6 +118,19 @@ function buildTiers(ctx: ExtensionContext, avoid: string[] = []) {
 	} as const;
 }
 
+// ---------- Statut (une seule ligne, discrète) ----------
+
+let lastRouted = "—";
+function setStatusLine(ctx: ExtensionContext, m: Model<never>, thinking: Thinking): void {
+	lastRouted = `${m.provider}/${m.id}`;
+	try {
+		const dim = ctx.ui.theme?.fg?.bind(ctx.ui.theme) ?? ((_: string, s: string) => s);
+		ctx.ui.setStatus("auto", dim("dim", `⚡ ${m.id} · ${thinking}`));
+	} catch {
+		ctx.ui.setStatus("auto", `${m.id} · ${thinking}`);
+	}
+}
+
 function toRoute(
 	request: Req,
 	ctx: ExtensionContext,
@@ -96,11 +138,7 @@ function toRoute(
 	thinking: Thinking,
 	state?: RouteState,
 ): ModelRoute<RouteState> {
-	lastRouted = `${m.provider}/${m.id}`;
-	ctx.ui.setStatus(
-		"auto-route",
-		`auto → ${m.provider}/${m.id} · thinking ${thinking}`,
-	);
+	setStatusLine(ctx, m, thinking);
 	return {
 		model: m,
 		thinkingLevel: thinking,
@@ -139,11 +177,8 @@ function tierFor(score: number): "frontier" | "strong" | "standard" | "eco" {
 	return "eco";
 }
 
-/** thinking automatique, plafonné par le choix explicite de l'utilisateur. */
 function capThinking(auto: Thinking, userSelected: Thinking): Thinking {
-	const autoIdx = THINKING_ORDER.indexOf(auto);
-	const userIdx = THINKING_ORDER.indexOf(userSelected);
-	return THINKING_ORDER[Math.min(autoIdx, userIdx)];
+	return THINKING_ORDER[Math.min(THINKING_ORDER.indexOf(auto), THINKING_ORDER.indexOf(userSelected))];
 }
 
 // ---------- Utilitaires ----------
@@ -168,56 +203,7 @@ function editedThisTurn(messages: readonly Message[]): boolean {
 		);
 }
 
-function key(m: Model<never>): string {
-	return `${m.provider}/${m.id}`;
-}
-
-// ---------- Capteur de quota (en-têtes de réponse) ----------
-
-const QUOTA_RE = /limit|ratelimit|rate-limit|remaining|reset|quota|budget|usage/i;
-let lastRouted = "?";
-let headersLogged = false;
-
-function captureHeaders(pi: ExtensionAPI) {
-	pi.on("after_provider_response", (event, ctx) => {
-		// Premier batch : tout logguer pour découvrir ce que le fournisseur expose.
-		if (!headersLogged) {
-			headersLogged = true;
-			try {
-				// eslint-disable-next-line no-console
-				console.error(
-					`[auto-route] headers de ${lastRouted} (status ${event.status}) :\n` +
-						Object.entries(event.headers)
-							.map(([k, v]) => `  ${k}: ${v}`)
-							.join("\n"),
-				);
-			} catch {
-				// stderr peut être indisponible selon le mode d'exécution.
-			}
-		}
-		const quota = Object.entries(event.headers).filter(([k]) => QUOTA_RE.test(k));
-		if (quota.length > 0) {
-			ctx.ui.setStatus(
-				"auto-route-quota",
-				quota.map(([k, v]) => `${k.replace(/^x-/i, "")}=${v}`).join(" · "),
-			);
-		}
-	});
-}
-
-// Adaptateur : garde les appels courts au fil des routes.
-function R(
-	request: Req,
-	ctx: ExtensionContext,
-	m: Model<never>,
-	thinking: Thinking,
-	state?: RouteState,
-): ModelRoute<RouteState> {
-	return toRoute(request, ctx, m, thinking, state);
-}
-
 export default function (pi: ExtensionAPI) {
-	captureHeaders(pi);
 	pi.registerVirtualModel<RouteState>({
 		provider: "auto",
 		id: "auto",
@@ -226,14 +212,18 @@ export default function (pi: ExtensionAPI) {
 		contextWindow: 200_000,
 		maxTokens: 64_000,
 		async route(request, ctx) {
-			// Appels hors boucle (compaction, résumés) → le plus léger.
 			if (request.reason === "direct") {
-				return R(request, ctx, buildTiers(ctx).background, "low");
+				return toRoute(request, ctx, buildTiers(ctx).background, "low");
 			}
 
-			// ---- RETRY : failover ----
+			// ---- RETRY / failover ----
 			if (request.reason === "retry" && request.failed) {
 				const failedKey = `${request.failed.model.provider}/${request.failed.model.id}`;
+				// Échec définitif → bannissement persistant (toutes sessions).
+				if (isPermanentFailure(request.failed.message?.errorMessage ?? "")) {
+					permanentDenylist.add(failedKey);
+					saveDenylist(permanentDenylist);
+				}
 				const state: RouteState = request.state ?? {
 					phase: "start",
 					modelId: request.failed.model.id,
@@ -242,56 +232,58 @@ export default function (pi: ExtensionAPI) {
 					avoid: [],
 				};
 				const avoid = [...new Set([...state.avoid, failedKey])];
-				// Stratégie : d'abord un autre modèle du même palier ; si le
-				// palier devient vide, buildTiers retombera sur un autre choix
-				// (pool filtré). Si on accumule 3+ échecs, on repart d'un
-				// palier plus léger pour garantir une réponse.
 				const tiers = buildTiers(ctx, avoid);
-				const candidates: Array<[keyof typeof tiers, Thinking]> =
+				const ladder: Array<["frontier" | "strong" | "standard" | "eco", Thinking]> =
 					avoid.length >= 3
 						? [["standard", state.thinking], ["eco", state.thinking]]
 						: [["strong", state.thinking], ["standard", state.thinking], ["eco", state.thinking]];
-				for (const [tier, th] of candidates) {
+				for (const [tier, th] of ladder) {
 					const m = tiers[tier];
-					if (m && !avoid.includes(key(m))) {
-						return R(request, ctx, m, th, { ...state, avoid });
+					if (m && !avoid.includes(`${m.provider}/${m.id}`)) {
+						return toRoute(request, ctx, m, th, { ...state, avoid });
 					}
 				}
-				// Dernier recours : le meilleur candidat restant, quel qu'il soit.
 				const any = buildTiers(ctx, avoid).frontier;
-				return R(request, ctx, any, state.thinking, { ...state, avoid });
+				return toRoute(request, ctx, any, state.thinking, { ...state, avoid });
 			}
 
 			const state = request.state;
 
-			// Déjà en phase implémentation → reste sur le même modèle.
+			// Phase implémentation → même modèle, thinking plafonné.
 			if (state?.phase === "impl") {
 				const m = ctx.modelRegistry.find(state.providerId, state.modelId);
 				if (m) {
 					const th = capThinking(state.thinking, request.thinkingLevel as Thinking);
-					return R(request, ctx, m, th, state);
+					return toRoute(request, ctx, m, th, state);
 				}
 			}
 
-			// Premier edit/write réussi du tour → bascule implémentation.
+			// Premier edit/write réussi → bascule implémentation (léger).
 			if (editedThisTurn(request.messages)) {
-				const eco = buildTiers(ctx).eco;
-				return R(request, ctx, eco, capThinking("medium", request.thinkingLevel as Thinking), {
-					phase: "impl",
-					modelId: eco.id,
-					providerId: eco.provider,
-					thinking: "medium",
-					avoid: state?.avoid ?? [],
-				});
+				const eco = buildTiers(ctx, state?.avoid ?? []).eco;
+				return toRoute(
+					request,
+					ctx,
+					eco,
+					capThinking("medium", request.thinkingLevel as Thinking),
+					{
+						phase: "impl",
+						modelId: eco.id,
+						providerId: eco.provider,
+						thinking: "medium",
+						avoid: state?.avoid ?? [],
+					},
+				);
 			}
 
 			// Nouveau tour → difficulté → palier + thinking (plafonné).
 			const score = difficultyScore(lastUserText(request.messages));
 			const tier = tierFor(score);
-			const autoTh: Thinking = score >= 0.7 ? "xhigh" : score >= 0.45 ? "high" : score >= 0.25 ? "medium" : "low";
+			const autoTh: Thinking =
+				score >= 0.7 ? "xhigh" : score >= 0.45 ? "high" : score >= 0.25 ? "medium" : "low";
 			const th = capThinking(autoTh, request.thinkingLevel as Thinking);
 			const m = buildTiers(ctx, state?.avoid ?? [])[tier];
-			return R(request, ctx, m, th, {
+			return toRoute(request, ctx, m, th, {
 				phase: "start",
 				modelId: m.id,
 				providerId: m.provider,
