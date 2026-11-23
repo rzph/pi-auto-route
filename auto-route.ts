@@ -62,10 +62,12 @@ const DEGRADE_AFTER_FAILURES = 3;
  * - `contributor`: OpenCode endpoints that train on your requests;
  * - `gemini-2.5-`: retired by Google for new accounts (404);
  * - `mimo-v2.5`: deprecated on OpenCode Go (410 ModelDeprecated);
+ * - `mimo-v2.6`: emits raw XML `<tool_call>` tags alongside empty `tool_calls`
+ *   deltas (`id: ""`, `name: ""`), poisoning the session transcript;
  * - `computer-use` / `robotics` / `deep-research`: specialized non-code models.
  */
 const EXCLUDED_MODEL_RE =
-	/free|contributor|gemini-2\.5-|mimo-v2\.5\b|computer-use|robotics|deep-research/i;
+	/free|contributor|gemini-2\.5-|mimo-v2\.[56]\b|computer-use|robotics|deep-research/i;
 
 /**
  * pi's agent config dir: honors PI_CODING_AGENT_DIR (its own env var, tilde
@@ -179,6 +181,11 @@ const PERMANENT_FAILURE_RE =
 const PROVIDER_LIMIT_FAILURE_RE =
 	/gousagelimiterror|freeusagelimiterror|usage limit|available balance|insufficient balance|credit balance|insufficient_quota|out of budget|out of credit|quota|billing|subscription_sharing|resource_exhausted|"code"\s*:\s*"?1308(?![0-9])|rate.?limit|too many requests|(?<![a-z0-9])429(?![a-z0-9])/i;
 
+const TRANSCRIPT_TOOL_CALL_FAILURE_RE =
+	/tool_call_id|function_response\.name|tool_use_id|tool_call.*must include|Name cannot be empty/i;
+
+const MISSING_TOOL_NAME = "__missing_tool_name__";
+
 /**
  * Classifies an assistant error message into one of four disjoint failure kinds:
  * - `"model-access"`: account cannot use THIS model (403 permission_error) — ban
@@ -198,27 +205,112 @@ export function classifyFailure(message: string): FailureKind {
 }
 
 /**
- * Turns a non-retryable provider-quota or model-access error into a "429" pi is
- * willing to retry. Pi drops these errors (retrying the same provider is
- * pointless); under auto-route the failover changes provider or model, so a
- * retry becomes useful: pi then calls `route(reason: "retry")` and the router
- * switches. Already-retryable errors (transient 429 rate limits, Google
- * `RESOURCE_EXHAUSTED` without billing/quota-exceeded wording, 5xx…) keep their
- * original text untouched.
+ * Turns a non-retryable provider-quota, model-access, or transcript tool-call
+ * schema error (e.g. Google 400 `function_response.name: Name cannot be empty`)
+ * into a "429" pi is willing to retry. Pi drops these errors (retrying the same
+ * provider is pointless); under auto-route the failover changes provider or
+ * model, so a retry becomes useful: pi then calls `route(reason: "retry")` and
+ * the router switches. Already-retryable errors (transient 429 rate limits,
+ * Google `RESOURCE_EXHAUSTED` without billing/quota-exceeded wording, 5xx…)
+ * keep their original text untouched.
  */
 export function toFailoverRetryMessage(msg: AssistantMessage): AssistantMessage | undefined {
 	if (msg.stopReason !== "error" || !msg.errorMessage) return undefined;
+	if (isRetryableAssistantError(msg)) return undefined;
 	const kind = classifyFailure(msg.errorMessage);
-	if ((kind !== "provider-limit" && kind !== "model-access") || isRetryableAssistantError(msg)) {
-		return undefined;
+	if (kind === "model-access") {
+		return {
+			...msg,
+			errorMessage: `auto-route: 429 model access — ${msg.provider}/${msg.model} not enabled on this account; retrying on another model`,
+		};
 	}
-	return {
-		...msg,
-		errorMessage:
-			kind === "model-access"
-				? `auto-route: 429 model access — ${msg.provider}/${msg.model} not enabled on this account; retrying on another model`
-				: `auto-route: 429 provider quota — ${msg.provider}/${msg.model} at limit; retrying on another model`,
-	};
+	if (kind === "provider-limit") {
+		return {
+			...msg,
+			errorMessage: `auto-route: 429 provider quota — ${msg.provider}/${msg.model} at limit; retrying on another model`,
+		};
+	}
+	if (kind === "transient" && TRANSCRIPT_TOOL_CALL_FAILURE_RE.test(msg.errorMessage)) {
+		return {
+			...msg,
+			errorMessage: `auto-route: 429 tool schema — ${msg.provider}/${msg.model} rejected a malformed tool call in history; retrying on another model`,
+		};
+	}
+	return undefined;
+}
+
+/**
+ * Repairs assistant `toolCall` blocks that carry an empty `id` or `name` before
+ * pi executes or persists them, so no `toolResult` with `toolCallId: ""` or
+ * `toolName: ""` can ever enter the session transcript.
+ */
+export function sanitizeAssistantToolCalls(msg: AssistantMessage): AssistantMessage | undefined {
+	if (msg?.role !== "assistant" || !Array.isArray(msg.content)) return undefined;
+	let changed = false;
+	const content = msg.content.map((block, i) => {
+		if (block.type !== "toolCall") return block;
+		const rawId = typeof block.id === "string" ? block.id.trim() : "";
+		const rawName = typeof block.name === "string" ? block.name.trim() : "";
+		const id = rawId || `call_fallback_${msg.timestamp || i}_${i}`;
+		const name = rawName || MISSING_TOOL_NAME;
+		if (id !== block.id || name !== block.name) {
+			changed = true;
+			return { ...block, id, name };
+		}
+		return block;
+	});
+	return changed ? { ...msg, content } : undefined;
+}
+
+/**
+ * Repairs already-persisted `toolCall` / `toolResult` pairs with empty `id` or
+ * `name` in the in-flight conversation context, so existing sessions poisoned by
+ * a broken tool call never trigger 400 errors on OpenAI or Google providers.
+ */
+export function sanitizeContextMessages(messages: readonly Message[]): Message[] | undefined {
+	let changed = false;
+	let seq = 0;
+	const pendingQueue: Array<{ id: string; name: string }> = [];
+
+	const out = messages.map((m) => {
+		if (m.role === "assistant" && Array.isArray(m.content)) {
+			let blockChanged = false;
+			const content = m.content.map((block) => {
+				if (block.type !== "toolCall") return block;
+				const rawId = typeof block.id === "string" ? block.id.trim() : "";
+				const rawName = typeof block.name === "string" ? block.name.trim() : "";
+				const id = rawId || `call_repaired_${++seq}`;
+				const name = rawName || MISSING_TOOL_NAME;
+				if (!rawId || !rawName) {
+					pendingQueue.push({ id, name });
+				}
+				if (id !== block.id || name !== block.name) {
+					blockChanged = true;
+					return { ...block, id, name };
+				}
+				return block;
+			});
+			if (blockChanged) {
+				changed = true;
+				return { ...m, content };
+			}
+			return m;
+		}
+		if (m.role === "toolResult") {
+			const rawId = typeof m.toolCallId === "string" ? m.toolCallId.trim() : "";
+			const rawName = typeof m.toolName === "string" ? m.toolName.trim() : "";
+			if (!rawId || !rawName) {
+				const paired = pendingQueue.shift();
+				const toolCallId = rawId || paired?.id || `call_repaired_${++seq}`;
+				const toolName = rawName || paired?.name || MISSING_TOOL_NAME;
+				changed = true;
+				return { ...m, toolCallId, toolName };
+			}
+		}
+		return m;
+	});
+
+	return changed ? out : undefined;
 }
 
 // Dynamic catalog
@@ -582,25 +674,42 @@ async function rerouteCurrentTurn(
 }
 
 export default function (pi: ExtensionAPI) {
+	// Sanitize already-persisted toolCall / toolResult messages with empty IDs or
+	// names before each provider request, healing sessions poisoned earlier.
+	pi.on("context", (event) => {
+		const messages = sanitizeContextMessages(event.messages);
+		if (messages) return { messages };
+	});
+
 	// Pi does NOT trigger `route(reason: "retry")` on 400/404 errors nor on
 	// provider-quota 429s (non-retryable classes). We listen to `message_end` to:
-	// 1. permanently ban models with permanent failures (404/410, retired models,
+	// 1. repair malformed assistant toolCalls (`id: ""` or `name: ""`) before pi
+	//    executes or persists them;
+	// 2. permanently ban models with permanent failures (404/410, retired models,
 	//    disabled model access…) — passively even when a physical model is
 	//    selected outside `auto/auto`, so the denylist learns dead endpoints
 	//    opportunistically;
-	// 2. rewrite quota/access errors into a retryable 429 when `auto/auto` is
-	//    active, so pi starts its retry → route(reason: "retry") → failover.
+	// 3. rewrite quota/access/tool-schema errors into a retryable 429 when
+	//    `auto/auto` is active, so pi starts its retry → route(reason: "retry")
+	//    → failover.
 	pi.on("message_end", (event, ctx) => {
 		const msg = event.message as AssistantMessage;
-		if (msg?.role !== "assistant" || msg.stopReason !== "error" || !msg.errorMessage) return;
-		const kind = classifyFailure(msg.errorMessage);
+		if (msg?.role !== "assistant") return;
+		const repaired = sanitizeAssistantToolCalls(msg);
+		if (msg.stopReason !== "error" || !msg.errorMessage) {
+			if (repaired) return { message: repaired };
+			return;
+		}
+		const target = repaired ?? msg;
+		const kind = classifyFailure(target.errorMessage!);
 		if (kind === "permanent" || kind === "model-access") {
-			banPermanently(msg.provider, msg.model);
+			banPermanently(target.provider, target.model);
 		}
 		if (ctx.model?.provider === "auto" && ctx.model?.id === "auto") {
-			const replacement = toFailoverRetryMessage(msg);
+			const replacement = toFailoverRetryMessage(target);
 			if (replacement) return { message: replacement };
 		}
+		if (repaired) return { message: repaired };
 	});
 
 	// Selecting `auto` starts at thinking `low` by default (ceiling, raise it
@@ -641,12 +750,16 @@ export default function (pi: ExtensionAPI) {
 					if (kind === "permanent" || kind === "model-access") {
 						banPermanently(request.failed.model.provider, request.failed.model.id);
 					}
-					// Model access disabled on the account: a per-model problem — other
-					// models of the same provider may still work, so avoid the model
-					// alone. Provider limit: avoid the whole provider, otherwise the
-					// failover lands on another of its models and fails again at once.
+					// Model access disabled on the account or tool-schema 400: a per-model
+					// problem — other models of the same provider may still work, so avoid
+					// the model alone. Provider limit: avoid the whole provider, otherwise
+					// the failover lands on another of its models and fails again at once.
+					const errText = request.failed.message?.errorMessage ?? "";
+					const isPerModelRewrite = /429 (?:model access|tool schema)/i.test(errText);
 					const avoidEntry =
-						kind === "provider-limit" ? request.failed.model.provider : failedKey;
+						kind === "provider-limit" && !isPerModelRewrite
+							? request.failed.model.provider
+							: failedKey;
 					avoid = [...new Set([...avoid, avoidEntry])];
 				}
 				const tiers = buildTiers(ctx, avoid);

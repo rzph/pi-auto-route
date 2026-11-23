@@ -21,6 +21,8 @@ const {
 	default: autoRoute,
 	classifyFailure,
 	resetDenylist,
+	sanitizeAssistantToolCalls,
+	sanitizeContextMessages,
 	toFailoverRetryMessage,
 } = await import("./auto-route.ts");
 
@@ -608,3 +610,126 @@ test("direct reason routes to eco at low thinking without state", async () => {
 	assert.equal(r.thinkingLevel, "low");
 	assert.equal(r.state, undefined);
 });
+
+test("message_end repairs assistant toolCalls with empty id or name before execution and persistence", async () => {
+	const { handlers } = loadRouter();
+	const brokenAssistant: any = {
+		role: "assistant",
+		stopReason: "toolUse",
+		provider: "opencode-go",
+		model: "mimo-v2.6-flash",
+		timestamp: 1795455941706,
+		content: [
+			{ type: "text", text: "Let me check..." },
+			{ type: "toolCall", id: "", name: "", arguments: {} },
+		],
+	};
+
+	const res = await handlers.message_end[0](
+		{ message: brokenAssistant },
+		{ model: { provider: "auto", id: "auto" } },
+	);
+	assert.ok(res?.message, "message_end must return a repaired message");
+	const tc = res.message.content[1];
+	assert.equal(tc.type, "toolCall");
+	assert.ok(tc.id.length > 0, "toolCall.id must be non-empty");
+	assert.equal(tc.name, "__missing_tool_name__", "toolCall.name must be filled with a fallback");
+
+	// Valid toolCalls remain untouched.
+	const validAssistant: any = {
+		...brokenAssistant,
+		content: [{ type: "toolCall", id: "call_123", name: "bash", arguments: { command: "ls" } }],
+	};
+	assert.equal(sanitizeAssistantToolCalls(validAssistant), undefined);
+});
+
+test("context hook repairs already-persisted empty toolCall and toolResult pairs in session history", async () => {
+	const { handlers } = loadRouter();
+	const poisonedHistory: any[] = [
+		{ role: "user", content: "hello" },
+		{
+			role: "assistant",
+			content: [
+				{ type: "text", text: "running tool" },
+				{ type: "toolCall", id: "", name: "", arguments: {} },
+			],
+		},
+		{
+			role: "toolResult",
+			toolCallId: "",
+			toolName: "",
+			content: [{ type: "text", text: "Tool  not found" }],
+			isError: true,
+		},
+	];
+
+	const res = await handlers.context[0]({ messages: poisonedHistory }, {});
+	assert.ok(res?.messages, "context hook must return sanitized messages when empty IDs/names exist");
+	const repairedCall = res.messages[1].content[1];
+	const repairedResult = res.messages[2];
+	assert.ok(repairedCall.id.length > 0);
+	assert.equal(repairedCall.name, "__missing_tool_name__");
+	assert.equal(repairedResult.toolCallId, repairedCall.id, "toolResult must pair with the repaired toolCall ID");
+	assert.equal(repairedResult.toolName, "__missing_tool_name__");
+
+	// Clean history returns undefined so prompt caching is preserved.
+	assert.equal(sanitizeContextMessages(res.messages), undefined);
+});
+
+test("Google 400 function_response.name error is rewritten into a per-model retryable 429 and avoids only the model", async () => {
+	const { vm, handlers } = loadRouter();
+	const google400: any = {
+		...QUOTA_ERROR,
+		provider: "google",
+		model: "gemini-3.1-flash-lite-preview",
+		errorMessage:
+			'{"error":{"message":"{\\n  \\"error\\": {\\n    \\"code\\": 400,\\n    \\"message\\": \\"* GenerateContentRequest.contents[10].parts[0].function_response.name: Name cannot be empty.\\\\n\\",\\n    \\"status\\": \\"INVALID_ARGUMENT\\"\\n  }\\n}\\n","code":400,"status":"Bad Request"}}',
+	};
+
+	const out = toFailoverRetryMessage(google400);
+	assert.ok(out, "Google 400 function_response.name error must be rewritten for failover");
+	assert.match(out.errorMessage, /429 tool schema/);
+
+	const models: any[] = [
+		{ provider: "google", id: "gemini-3.1-flash-lite-preview", name: "Gemini Lite", reasoning: true, cost: { input: 0.5, output: 2 }, contextWindow: 200000 },
+		{ provider: "google", id: "gemini-4-argon", name: "Gemini 4", reasoning: true, cost: { input: 2, output: 10 }, contextWindow: 200000 },
+	];
+	const ctx = makeCtx(models);
+	const rewritten = (
+		await handlers.message_end[0]({ message: google400 }, { model: { provider: "auto", id: "auto" } })
+	).message;
+
+	const r = await vm.route(
+		{
+			reason: "retry",
+			thinkingLevel: "xhigh",
+			failed: { model: models[0], thinkingLevel: "medium", message: rewritten },
+			messages: [{ role: "user", content: "ok" }],
+			state: undefined,
+		},
+		ctx,
+	);
+	assert.ok(r.state.avoid.includes("google/gemini-3.1-flash-lite-preview"));
+	assert.ok(!r.state.avoid.includes("google"), "must not avoid the whole provider on a tool schema 400");
+});
+
+test("mimo-v2.6 models are excluded from candidates", async () => {
+	const { vm } = loadRouter();
+	const models: any[] = [
+		{ provider: "opencode-go", id: "mimo-v2.6-flash", name: "MiMo v2.6 Flash", reasoning: true, cost: { input: 0.2, output: 1 }, contextWindow: 200000 },
+		{ provider: "opencode-go", id: "qwen3.8-flash", name: "Qwen 3.8 Flash", reasoning: true, cost: { input: 0.5, output: 2 }, contextWindow: 200000 },
+	];
+	const ctx = makeCtx(models);
+
+	const r = await vm.route(
+		{
+			reason: "user",
+			thinkingLevel: "low",
+			messages: [{ role: "user", content: "ok" }],
+			state: undefined,
+		},
+		ctx,
+	);
+	assert.equal(r.model.id, "qwen3.8-flash", "mimo-v2.6-flash must be excluded");
+});
+
