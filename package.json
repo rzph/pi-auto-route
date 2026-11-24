@@ -24,7 +24,8 @@
 		"LICENSE"
 	],
 	"scripts": {
-		"test": "node --test *.test.ts"
+		"test": "node --test *.test.ts",
+		"typecheck": "tsc -p tsconfig.json"
 	},
 	"pi": {
 		"extensions": [
@@ -34,5 +35,9 @@
 	"peerDependencies": {
 		"@earendil-works/pi-ai": "*",
 		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@types/node": "^24.0.0",
+		"typescript": "^5.9.0"
 	}
 }

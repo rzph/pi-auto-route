@@ -26,6 +26,12 @@ const {
 	toFailoverRetryMessage,
 } = await import("./auto-route.ts");
 
+/** pi types `errorMessage` as optional; every assertion here needs the text. */
+function errMsg(m: { errorMessage?: string }): string {
+	if (typeof m.errorMessage !== "string") assert.fail("expected an assistant error message");
+	return m.errorMessage;
+}
+
 const DENYLIST = join(AGENT_DIR, "auto-route-denylist.json");
 
 beforeEach(() => {
@@ -83,10 +89,10 @@ const PI_NON_RETRYABLE_MARKERS = [
 test("toFailoverRetryMessage rewrites a quota 429 into a retryable error", () => {
 	const out = toFailoverRetryMessage(QUOTA_ERROR);
 	assert.ok(out, "the quota 429 must be rewritten");
-	assert.match(out.errorMessage, /429/, "the rewritten text must carry pi's retryable \"429\" pattern");
+	assert.match(errMsg(out), /429/, "the rewritten text must carry pi's retryable \"429\" pattern");
 	for (const marker of PI_NON_RETRYABLE_MARKERS) {
 		assert.ok(
-			!out.errorMessage.includes(marker),
+			!errMsg(out).includes(marker),
 			`the rewritten text must not contain "${marker}"`,
 		);
 	}
@@ -104,8 +110,8 @@ test("a Google quota/billing 429 is rewritten, while a transient Google 429 RESO
 	};
 	const out = toFailoverRetryMessage(googleBilling);
 	assert.ok(out, "the Google billing/quota 429 must be rewritten");
-	assert.match(out.errorMessage, /429/);
-	assert.ok(!/billing|quota exceeded/i.test(out.errorMessage));
+	assert.match(errMsg(out), /429/);
+	assert.ok(!/billing|quota exceeded/i.test(errMsg(out)));
 
 	// Transient rate-limit 429 RESOURCE_EXHAUSTED without billing/quota-exceeded:
 	// pi already treats it as retryable, so it must not be rewritten.
@@ -131,8 +137,8 @@ test("a Zhipu 1308 usage-limit 429 is classified as provider-limit and rewritten
 	assert.equal(classifyFailure(zhipu.errorMessage), "provider-limit");
 	const out = toFailoverRetryMessage(zhipu);
 	assert.ok(out, "Zhipu 1308 must be rewritten because pi treats code 1308 as non-retryable");
-	assert.match(out.errorMessage, /429 provider quota/);
-	assert.ok(!out.errorMessage.includes("1308"));
+	assert.match(errMsg(out), /429 provider quota/);
+	assert.ok(!errMsg(out).includes("1308"));
 });
 
 test("a 403 model-access error is rewritten into a retryable 429 (found live: opencode Zen models disabled on a Go key)", () => {
@@ -145,15 +151,15 @@ test("a 403 model-access error is rewritten into a retryable 429 (found live: op
 	};
 	const out = toFailoverRetryMessage(disabled);
 	assert.ok(out, "the 403 model-access error must be rewritten");
-	assert.match(out.errorMessage, /429/, "the rewritten text must carry pi's retryable 429");
+	assert.match(errMsg(out), /429/, "the rewritten text must carry pi's retryable 429");
 	assert.ok(
-		!/permission_error/i.test(out.errorMessage),
+		!/permission_error/i.test(errMsg(out)),
 		"the rewritten text must not carry the provider's non-retryable wording",
 	);
 	// A disabled model is a per-model problem: classified as model-access (and
 	// still recognized as model-access after the rewrite).
 	assert.equal(classifyFailure(disabled.errorMessage), "model-access");
-	assert.equal(classifyFailure(out.errorMessage), "model-access");
+	assert.equal(classifyFailure(errMsg(out)), "model-access");
 });
 
 test("an insufficient-balance 402 (pay-as-you-go provider not covered by the key) is rewritten", () => {
@@ -166,15 +172,15 @@ test("an insufficient-balance 402 (pay-as-you-go provider not covered by the key
 	};
 	const out = toFailoverRetryMessage(balance);
 	assert.ok(out, "the 402 insufficient-balance error must be rewritten");
-	assert.match(out.errorMessage, /429/, "the rewritten text must carry pi's retryable 429");
+	assert.match(errMsg(out), /429/, "the rewritten text must carry pi's retryable 429");
 	assert.ok(
-		!/insufficient balance|billing/i.test(out.errorMessage),
+		!/insufficient balance|billing/i.test(errMsg(out)),
 		"the rewritten text must not carry the provider's non-retryable wording",
 	);
 	// A balance problem is account-wide: the whole provider is the right scope,
 	// and it is not a permanent model failure.
 	assert.equal(classifyFailure(balance.errorMessage), "provider-limit");
-	assert.equal(classifyFailure(out.errorMessage), "provider-limit");
+	assert.equal(classifyFailure(errMsg(out)), "provider-limit");
 });
 
 test("request-specific 400 errors (unsupported image format, file not found) are transient and never ban the model", async () => {
@@ -688,7 +694,7 @@ test("Google 400 function_response.name error is rewritten into a per-model retr
 
 	const out = toFailoverRetryMessage(google400);
 	assert.ok(out, "Google 400 function_response.name error must be rewritten for failover");
-	assert.match(out.errorMessage, /429 tool schema/);
+	assert.match(errMsg(out), /429 tool schema/);
 
 	const models: any[] = [
 		{ provider: "google", id: "gemini-3.1-flash-lite-preview", name: "Gemini Lite", reasoning: true, cost: { input: 0.5, output: 2 }, contextWindow: 200000 },

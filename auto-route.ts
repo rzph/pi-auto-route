@@ -38,6 +38,7 @@ import type {
 	ModelThinkingLevel,
 } from "@earendil-works/pi-ai";
 import type {
+	ContextEvent,
 	ExtensionAPI,
 	ExtensionContext,
 	ModelRoute,
@@ -263,11 +264,21 @@ export function sanitizeAssistantToolCalls(msg: AssistantMessage): AssistantMess
 }
 
 /**
+ * Element type of pi's `context` event: the LLM `Message` union plus the app's
+ * custom transcript messages (bash runs, extension messages…). Derived from the
+ * event itself, so the sanitizer below cannot drift from what pi hands over.
+ */
+type ContextMessage = ContextEvent["messages"][number];
+
+/**
  * Repairs already-persisted `toolCall` / `toolResult` pairs with empty `id` or
  * `name` in the in-flight conversation context, so existing sessions poisoned by
  * a broken tool call never trigger 400 errors on OpenAI or Google providers.
+ * Custom message kinds pass through untouched.
  */
-export function sanitizeContextMessages(messages: readonly Message[]): Message[] | undefined {
+export function sanitizeContextMessages(
+	messages: readonly ContextMessage[],
+): ContextMessage[] | undefined {
 	let changed = false;
 	let seq = 0;
 	const pendingQueue: Array<{ id: string; name: string }> = [];
