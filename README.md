@@ -18,6 +18,8 @@ Then in pi: `/reload`, and pick **auto → auto** in the model selector (`/model
 - remove: `pi remove npm:pi-auto-route`
 - without npm: `pi install git:github.com/rzph/pi-auto-route`, or copy `auto-route.ts` into `~/.pi/agent/extensions/` by hand
 
+Optional add-on, not installed by `pi install`: [inkling/](inkling/README.md) routes short tool-free prompts to a local llama.cpp model (zero cost, offline). Copy `inkling/inkling-auto-router.ts` into `~/.pi/agent/extensions/` to enable it.
+
 Selecting `auto` starts at thinking `low`. That level is a **ceiling**, not a target: raise it with `shift+tab` when you want the router to think harder.
 
 ## Usage
@@ -35,7 +37,7 @@ Three things worth knowing up front:
 - pi with at least one provider that has valid credentials. Nothing is hardcoded to a specific provider: the candidate catalog, the tiers and the failover are all built from your own model registry at runtime.
 - No API key of its own: without a classifier, the difficulty heuristic runs entirely locally, with no network calls.
 - A classifier model from any provider is optional and auto-detected; without one the local heuristic is used, so no extra credential is ever required.
-- Only to run the test suite: Node.js 22.6 or newer (`node --test *.test.ts`).
+- Only to run the test suite: Node.js 22.6 or newer (`npm test`), and `npm run typecheck` for the API-type check (`npm install` first).
 
 ## How it works
 
@@ -74,6 +76,11 @@ Keys are tried in order, and a key the classifier rejects moves on to the next c
 A model is excluded as free only when its pricing says 0; missing pricing means unknown and stays a candidate, ranked at a mid cost. An empty tier falls back to the next one; if everything fails, you get an explicit error.
 
 ## Customize
+
+Two files matter:
+
+- `auto-route.ts`: the tier router;
+- `inkling/inkling-auto-router.ts`: the optional local-model router (see [inkling/README.md](inkling/README.md)).
 
 Everything is set at the top of `auto-route.ts`:
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.0
+
+- Measured and documented the two constraints that decide every local-model number (`inkling/README.md`): llama.cpp refuses a request larger than `-c` (pi's tool prompt is ~8.5k tokens, ~730 without tools), and pi reserves `max(4096, 15 %)` tokens of output headroom, which made a `contextWindow: 4096` model answer with `max_completion_tokens: 1` — silently empty. The add-on now ships `-c 6144` / `contextWindow: 6144` / `maxTokens: 1300` plus per-model compaction overrides.
+- `leaveInkling` restores the recorded model if it is still in the catalog, else the configured default, and a manual model switch during a local turn ends the routing instead of being overwritten by it.
+
+- New optional add-on, `inkling/`: a companion router that sends short, tool-free prompts to a local llama.cpp model (zero cost, offline) and hands the session back on the next turn. Ships as files to copy, deliberately **outside** `pi.extensions` — without a local server it would only warn. Includes `start-inkling-server.sh` (detached launch, never kills a server it did not start), a `models.json` example and `inkling/README.md`.
+- The local router owns exactly one invariant, enforced in one place (the `model_select` handler, which fires for manual picks and for `pi.setModel()` alike): Inkling is current only with the tools stripped, since pi's tool prompt (~8.5k tokens) does not fit its window. A manual model pick is respected and never routed away from; a cold server warms up in the background instead of stalling the current turn.
+- `npm run typecheck` (`tsc`, strict) and a CI workflow: extensions are loaded by jiti without type checking, so a wrong API call — `ctx.exec()` instead of `pi.exec()` — used to fail only at runtime, inside a turn.
+- `sanitizeContextMessages` now takes pi's own context type (`ContextEvent["messages"][number]`, i.e. LLM messages plus custom transcript entries). It was typed as the pi-ai `Message[]` the `context` event does not deliver; the mismatch surfaced as soon as the file was typechecked.
+- Tests: +11 for the local add-on (`inkling.test.ts`): the prompt gate, plus the model/tool state machine driven through a fake pi whose `setModel` emits `model_select` like the real one — that is where the restored-tool-set and manual-switch regressions live. The failover test now reads `errorMessage` through one asserting helper instead of 13 non-null assertions.
+
 ## 1.3.3
 
 - Any configured provider key can unlock a free classifier, not just `opencode-go`: the router scans every provider holding a key (`getAll` + `getApiKeyForProvider`) and tries them in order, so an OpenCode key sitting under an unexpected provider name is found too.

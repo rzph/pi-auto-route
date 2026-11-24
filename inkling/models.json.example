@@ -1,0 +1,36 @@
+{
+  "providers": {
+    "inkling-local": {
+      "name": "Inkling Local",
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "api": "openai-completions",
+      "apiKey": "local",
+      "authHeader": false,
+      "models": [
+        {
+          "id": "inkling-2-mini-iq1m",
+          "name": "Inkling 2 Mini IQ1_M (local)",
+          "reasoning": false,
+          "input": [
+            "text"
+          ],
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
+          "contextWindow": 6144,
+          "maxTokens": 1300,
+          "compat": {
+            "thinkingFormat": "chat-template",
+            "chatTemplateKwargs": {
+              "reasoning_effort": "low"
+            },
+            "supportsReasoningEffort": false
+          }
+        }
+      ]
+    }
+  }
+}
